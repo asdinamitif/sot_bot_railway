@@ -4,7 +4,10 @@ import sqlite3
 from datetime import datetime, timedelta, time, date
 from typing import Optional, Dict, Any, List
 
+import time as time_module
+
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -33,7 +36,7 @@ log = logging.getLogger("sot_bot")
 # ----------------- ENV / НАСТРОЙКИ -----------------
 load_dotenv()
 
-# Токен теперь берём из окружения (на Railway → Variables → BOT_TOKEN)
+# Токен берём из окружения (Railway → Variables → BOT_TOKEN)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 DB_PATH = os.getenv("DB_PATH", "sot_bot.db")
@@ -42,6 +45,11 @@ DB_PATH = os.getenv("DB_PATH", "sot_bot.db")
 SCHEDULE_PATH = os.getenv("SCHEDULE_PATH", "График выездов отдела СОТ.xlsx")
 # 2-й файл: для 📝 Замечания и 🏗 ОНзС
 REMARKS_PATH = os.getenv("REMARKS_PATH", "График выездов отдела СОТ.xlsx")
+
+# URL для скачивания Excel с замечаниями (Google Sheets / другое облако)
+REMARKS_URL = os.getenv("REMARKS_URL", "").strip()
+# TTL для авто-синхронизации (секунд). Если файл старше — перекачиваем из REMARKS_URL.
+REMARKS_SYNC_TTL_SEC = int(os.getenv("REMARKS_SYNC_TTL_SEC", "3600"))
 
 TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "3"))  # МСК: +3
 ANALYTICS_PASSWORD = "051995"
@@ -159,7 +167,50 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
     return load_excel_cached(SCHEDULE_PATH, SCHEDULE_CACHE)
 
 
+def download_remarks_if_needed() -> None:
+    """
+    Вариант C:
+    - Если REMARKS_URL не задан — ничего не делаем.
+    - Если локального REMARKS_PATH нет — качаем из REMARKS_URL.
+    - Если локальный есть, но старше REMARKS_SYNC_TTL_SEC — перекачиваем.
+    - Если админ недавно загрузил файл руками — у него свежий mtime, и мы не трогаем его
+      до истечения TTL.
+    """
+    if not REMARKS_URL:
+        return
+
+    need_download = False
+    if not os.path.exists(REMARKS_PATH):
+        need_download = True
+    else:
+        try:
+            mtime = os.path.getmtime(REMARKS_PATH)
+            age = time_module.time() - mtime
+            if age > REMARKS_SYNC_TTL_SEC:
+                need_download = True
+        except Exception as e:
+            log.warning("Не удалось проверить возраст REMARKS_PATH: %s", e)
+            need_download = True
+
+    if not need_download:
+        return
+
+    try:
+        log.info("Скачиваю файл замечаний из REMARKS_URL (авто-синхронизация)...")
+        resp = requests.get(REMARKS_URL, timeout=30)
+        resp.raise_for_status()
+        with open(REMARKS_PATH, "wb") as f:
+            f.write(resp.content)
+        REMARKS_CACHE["mtime"] = None
+        REMARKS_CACHE["df"] = None
+        log.info("Файл замечаний успешно скачан и сохранён в %s", REMARKS_PATH)
+    except Exception as e:
+        log.warning("Не удалось скачать файл замечаний из REMARKS_URL: %s", e)
+
+
 def get_remarks_df() -> Optional[pd.DataFrame]:
+    # Вариант C: сначала проверяем, нужно ли синхронизировать с REMARKS_URL
+    download_remarks_if_needed()
     return load_remarks_cached(REMARKS_PATH, REMARKS_CACHE)
 
 
@@ -1397,8 +1448,9 @@ async def handle_menu_remarks(
     await update.message.reply_text(
         "Раздел «Замечания».\n"
         "1) Через «⬆ Загрузить» админ загружает рабочий файл с замечаниями.\n"
-        "2) Статусы «Устранены» / «Не устранены» / «Не требуется» берутся из столбцов Q, R, Y, AD.\n"
-        "3) Через кнопки ниже выводятся списки по этим статусам.",
+        "2) Если настроен REMARKS_URL, бот периодически подтягивает свежий файл из Google Sheets.\n"
+        "3) Статусы «Устранены» / «Не устранены» / «Не требуется» берутся из столбцов Q, R, Y, AD.\n"
+        "4) Через кнопки ниже выводятся списки по этим статусам.",
         reply_markup=remarks_menu_inline(),
     )
 
