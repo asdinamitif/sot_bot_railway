@@ -87,8 +87,9 @@ REMARKS_CACHE: Dict[str, Any] = {"mtime": None, "df": None}
 
 def local_now() -> datetime:
     return datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
-# ----------------- РАБОТА С EXCEL -----------------
 
+
+# ----------------- РАБОТА С EXCEL -----------------
 def load_excel_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFrame]:
     """
     Загрузка Excel для раздела «📅 График» (только 1 лист).
@@ -145,7 +146,7 @@ def load_remarks_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFra
     for sheet in xls.sheet_names:
         try:
             raw = pd.read_excel(xls, sheet_name=sheet, header=None)
-        except:
+        except Exception:
             continue
 
         header_row = 0
@@ -157,7 +158,7 @@ def load_remarks_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFra
 
         try:
             df_sheet = pd.read_excel(xls, sheet_name=sheet, header=header_row)
-        except:
+        except Exception:
             continue
 
         df_sheet = df_sheet.dropna(how="all").reset_index(drop=True)
@@ -198,7 +199,7 @@ def download_remarks_if_needed() -> None:
             age = time_module.time() - mtime
             if age > REMARKS_SYNC_TTL_SEC:
                 need = True
-        except:
+        except Exception:
             need = True
 
     if not need:
@@ -249,8 +250,9 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
 def get_remarks_df() -> Optional[pd.DataFrame]:
     download_remarks_if_needed()
     return load_remarks_cached(REMARKS_PATH, REMARKS_CACHE)
-# ----------------- ПОИСК КОЛОНОК В EXCEL -----------------
 
+
+# ----------------- ПОИСК КОЛОНОК В EXCEL -----------------
 def find_col(df: pd.DataFrame, hints) -> Optional[str]:
     """
     Поиск колонки по частичному совпадению.
@@ -270,7 +272,6 @@ def find_col(df: pd.DataFrame, hints) -> Optional[str]:
 
 
 # -------- Excel: "AC" → индекс --------
-
 def excel_col_to_index(col: str) -> int:
     """
     Перевод буквенного номера столбца Excel (AC, AI, O и т.п.)
@@ -296,7 +297,6 @@ def get_col_by_letter(df: pd.DataFrame, col_letters: str) -> Optional[str]:
 
 
 # ----------------- МОДУЛЬ «ИНСПЕКТОР»: запись строки -----------------
-
 def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
     """
     Добавляет новую строку (выезд инспектора) в лист INSPECTOR_SHEET_NAME
@@ -387,6 +387,479 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
 
     log.info("Инспектор: добавлена строка %s в лист %s", new_row, INSPECTOR_SHEET_NAME)
     return True
+
+
+# ----------------- ПРОСТЫЕ ФУНКЦИИ ДЛЯ БД -----------------
+def init_db() -> None:
+    """
+    Создаёт SQLite-базу и все необходимые таблицы,
+    чтобы бот не падал при чтении согласований, аналитики и администраторов.
+    """
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # Администраторы
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS admins (
+            username TEXT PRIMARY KEY
+        );
+        """
+    )
+
+    # Метаданные файла 📅 Графика
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schedule_meta (
+            id INTEGER PRIMARY KEY,
+            current_rev INTEGER NOT NULL,
+            file_name TEXT,
+            uploaded_at TEXT,
+            approvers TEXT
+        );
+        """
+    )
+
+    # История согласований графика
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schedule_approvals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            schedule_rev INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            approved_at TEXT NOT NULL
+        );
+        """
+    )
+
+    # История загрузок файлов 📝 Замечаний
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS remarks_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_name TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL,
+            approvers TEXT,
+            approved_by TEXT,
+            status TEXT
+        );
+        """
+    )
+
+    # Если ADMIN_ID задан – добавим в таблицу admins
+    if ADMIN_ID != 0:
+        # username мы не знаем, поэтому можно хранить как специальную запись,
+        # но для простоты пока не добавляем – админ будет управлять через /add_admin
+        pass
+
+    conn.commit()
+    conn.close()
+    log.info("База данных инициализирована.")
+
+
+def get_admins() -> List[str]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT username FROM admins ORDER BY username;")
+    rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def add_admin(username: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO admins (username) VALUES (?);",
+        (username,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def del_admin(username: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM admins WHERE username = ?;",
+        (username,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_super_admin(update: Update) -> bool:
+    """
+    Допуск к командам управления администраторами.
+    Или по chat_id (ADMIN_ID), или по таблице admins.
+    """
+    user = update.effective_user
+    if not user:
+        return False
+
+    if ADMIN_ID and user.id == ADMIN_ID:
+        return True
+
+    username = (user.username or "").lower()
+    if not username:
+        return False
+
+    admins = [a.lower() for a in get_admins()]
+    return username in admins
+
+
+# ----------------- ОБРАБОТЧИКИ КОМАНД -----------------
+MAIN_MENU_KEYBOARD = [
+    ["📅 График", "📝 Замечания"],
+    ["🏗 ОНзС", "📈 Аналитика"],
+    ["👮‍♂️ Инспектор"],
+]
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    kb = ReplyKeyboardMarkup(
+        keyboard=MAIN_MENU_KEYBOARD,
+        resize_keyboard=True,
+    )
+    text = (
+        "Добро пожаловать в бота отдела СОТ.\n\n"
+        "Выберите раздел на клавиатуре ниже."
+    )
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    await update.message.reply_text(
+        f"Ваш user_id: {user.id}\nchat_id: {chat.id}"
+    )
+
+
+async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_super_admin(update):
+        await update.message.reply_text("Недостаточно прав для просмотра администраторов.")
+        return
+
+    admins = get_admins()
+    if not admins:
+        await update.message.reply_text("Список администраторов пуст.")
+        return
+
+    text = "Текущие администраторы:\n" + "\n".join(f"• {a}" for a in admins)
+    await update.message.reply_text(text)
+
+
+async def cmd_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_super_admin(update):
+        await update.message.reply_text("Недостаточно прав для добавления администратора.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Укажи username, например: /add_admin @user")
+        return
+
+    username = context.args[0].strip()
+    if username.startswith("@"):
+        username = username[1:]
+
+    if not username:
+        await update.message.reply_text("Username не распознан.")
+        return
+
+    add_admin(username)
+    await update.message.reply_text(f"Администратор @{username} добавлен.")
+
+
+async def cmd_del_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_super_admin(update):
+        await update.message.reply_text("Недостаточно прав для удаления администратора.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Укажи username, например: /del_admin @user")
+        return
+
+    username = context.args[0].strip()
+    if username.startswith("@"):
+        username = username[1:]
+
+    if not username:
+        await update.message.reply_text("Username не распознан.")
+        return
+
+    del_admin(username)
+    await update.message.reply_text(f"Администратор @{username} удалён.")
+
+
+# ----------------- CALLBACK'И (УПРОЩЁННЫЕ) -----------------
+async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик всех callback'ов 'schedule_*' (упрощённый)."""
+    query = update.callback_query
+    await query.answer()
+
+    df = get_schedule_df()
+    if df is None:
+        await query.edit_message_text("Файл графика не найден или не читается.")
+        return
+
+    # Простой пример: показать первые 5 строк с датами
+    text_lines = ["Первые 5 выездов из графика:"]
+    head = df.head(5)
+    date_col = find_col(head, ["дата выезда", "дата"])
+    obj_col = find_col(head, ["объект", "наименование объекта"])
+
+    for _, row in head.iterrows():
+        dt = row.get(date_col, "")
+        obj = row.get(obj_col, "")
+        text_lines.append(f"• {dt} — {obj}")
+
+    await query.edit_message_text("\n".join(text_lines))
+
+
+async def remarks_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик 'remarks_*' (упрощённый просмотр)."""
+    query = update.callback_query
+    await query.answer()
+
+    df = get_remarks_df()
+    if df is None:
+        await query.edit_message_text("Рабочий файл с замечаниями не найден или не читается.")
+        return
+
+    text_lines = ["Рабочий файл загружен.", f"Всего строк: {len(df)}"]
+    await query.edit_message_text("\n".join(text_lines))
+
+
+async def onzs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик номера ОНзС: onzs_1, onzs_2, ... (пока просто подтверждение)."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # onzs_X
+    onzs_num = data.split("_", 1)[-1]
+
+    await query.edit_message_text(f"Выбрана категория ОНзС №{onzs_num}.\nФильтрация по таблице пока упрощена.")
+
+
+async def onzs_period_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик выбора периода (упрощённый)."""
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text("Выбор периода ОНзС пока реализован в базовом виде. Детальная фильтрация не настроена.")
+
+
+async def notes_status_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик статусов ПБ/АР и вложений (упрощённый)."""
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text("Обновление статуса/вложений пока реализовано только в базовом виде.")
+
+
+# ----------------- МАСТЕР «ИНСПЕКТОР» -----------------
+INSPECTOR_STEPS = ["date", "area", "floors", "onzs", "developer", "object", "address", "case_no", "check_type"]
+
+INSPECTOR_PROMPTS = {
+    "date": "Введите дату выезда (в формате ДД.ММ.ГГГГ):",
+    "area": "Введите площадь объекта (кв.м):",
+    "floors": "Введите количество этажей:",
+    "onzs": "Введите номер ОНзС (1–12):",
+    "developer": "Введите наименование застройщика:",
+    "object": "Введите наименование объекта:",
+    "address": "Введите строительный адрес:",
+    "case_no": "Введите номер дела (формат 00-00-000000):",
+    "check_type": "Введите вид проверки (ПП, итоговая, профвизит, запрос ОНзС, поручение руководства):",
+}
+
+
+async def inspector_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback для insp_* (мастер инспектора)."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    if data == "insp_add_trip":
+        # Запуск мастера
+        context.user_data["insp_form"] = {}
+        context.user_data["insp_step"] = "date"
+
+        await query.edit_message_text(
+            "Мастер добавления выезда инспектора.\n\n" + INSPECTOR_PROMPTS["date"]
+        )
+    else:
+        await query.edit_message_text("Неизвестное действие инспектора.")
+
+
+def build_inspector_menu() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("➕ Добавить выезд", callback_data="insp_add_trip")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+# ----------------- ОБРАБОТЧИК ДОКУМЕНТОВ/ФОТО -----------------
+async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик фото / файлов, которые пользователь отправляет.
+    Пока только подтверждаем получение.
+    """
+    message = update.effective_message
+    await message.reply_text("Файл/фото получен. Логика прикрепления к строкам пока упрощена.")
+
+
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Отдельный обработчик документов (например, Excel).
+    В упрощённой версии просто отвечаем, что файл получен.
+    """
+    doc: Document = update.message.document
+    await update.message.reply_text(f"Получен файл: {doc.file_name}")
+
+
+# ----------------- РОУТЕР ТЕКСТА -----------------
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Маршрутизатор обычного текста:
+    - меню
+    - шаги мастера «Инспектор»
+    """
+    text = (update.message.text or "").strip()
+
+    # Проверка: мастер инспектора в процессе?
+    if "insp_step" in context.user_data:
+        step = context.user_data.get("insp_step")
+        form = context.user_data.get("insp_form", {})
+
+        # Сохраняем ответ
+        if step == "date":
+            # пробуем распарсить дату
+            try:
+                dt = datetime.strptime(text, "%d.%m.%Y").date()
+                form["date"] = dt
+            except Exception:
+                await update.message.reply_text("Не удалось распознать дату. Введите в формате ДД.ММ.ГГГГ.")
+                return
+
+        elif step == "area":
+            form["area"] = text
+
+        elif step == "floors":
+            form["floors"] = text
+
+        elif step == "onzs":
+            form["onzs"] = text
+
+        elif step == "developer":
+            form["developer"] = text
+
+        elif step == "object":
+            form["object"] = text
+
+        elif step == "address":
+            form["address"] = text
+
+        elif step == "case_no":
+            form["case_no"] = text
+
+        elif step == "check_type":
+            form["check_type"] = text
+
+        context.user_data["insp_form"] = form
+
+        # Переход к следующему шагу
+        current_index = INSPECTOR_STEPS.index(step)
+        if current_index + 1 < len(INSPECTOR_STEPS):
+            next_step = INSPECTOR_STEPS[current_index + 1]
+            context.user_data["insp_step"] = next_step
+            await update.message.reply_text(INSPECTOR_PROMPTS[next_step])
+            return
+        else:
+            # Завершаем мастер, пишем в Excel
+            ok = append_inspector_row_to_excel(form)
+            context.user_data.pop("insp_step", None)
+            context.user_data.pop("insp_form", None)
+
+            if ok:
+                await update.message.reply_text(
+                    "Запись успешно добавлена в лист "
+                    f"«{INSPECTOR_SHEET_NAME}» файла REMARKS_PATH."
+                )
+            else:
+                await update.message.reply_text(
+                    "Не удалось записать выезд инспектора в файл. "
+                    "Проверьте доступность REMARKS_PATH на сервере."
+                )
+            return
+
+    # --- Меню ---
+    if text == "📅 График":
+        df = get_schedule_df()
+        if df is None:
+            await update.message.reply_text("Файл графика не найден или не читается.")
+            return
+
+        head = df.head(5)
+        date_col = find_col(head, ["дата выезда", "дата"])
+        obj_col = find_col(head, ["объект", "наименование объекта"])
+
+        lines = ["Первые 5 выездов:", ""]
+        for _, row in head.iterrows():
+            dt = row.get(date_col, "")
+            obj = row.get(obj_col, "")
+            lines.append(f"• {dt} — {obj}")
+
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if text == "📝 Замечания":
+        df = get_remarks_df()
+        if df is None:
+            await update.message.reply_text("Рабочий файл с замечаниями не найден или не читается.")
+            return
+
+        await update.message.reply_text(
+            f"Файл с замечаниями загружен.\nВсего строк: {len(df)}"
+        )
+        return
+
+    if text == "🏗 ОНзС":
+        # Простая клавиатура с номерами 1–12
+        kb = [
+            [
+                InlineKeyboardButton(str(i), callback_data=f"onzs_{i}")
+                for i in range(1, 7)
+            ],
+            [
+                InlineKeyboardButton(str(i), callback_data=f"onzs_{i}")
+                for i in range(7, 13)
+            ],
+        ]
+        markup = InlineKeyboardMarkup(kb)
+        await update.message.reply_text("Выберите номер ОНзС:", reply_markup=markup)
+        return
+
+    if text == "📈 Аналитика":
+        await update.message.reply_text("Раздел 📈 Аналитика будет доработан отдельно.")
+        return
+
+    if text == "👮‍♂️ Инспектор":
+        markup = build_inspector_menu()
+        await update.message.reply_text(
+            "Раздел «Инспектор».\nНажмите «➕ Добавить выезд» для запуска мастера.",
+            reply_markup=markup,
+        )
+        return
+
+    # По умолчанию
+    await update.message.reply_text(
+        "Команда не распознана. Используйте меню или /start."
+    )
+
+
 # ----------------- ОБРАБОТЧИК ОШИБОК -----------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Ошибка при обработке апдейта:", exc_info=context.error)
