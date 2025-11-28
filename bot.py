@@ -75,6 +75,14 @@ INSPECTOR_SHEET_NAME = os.getenv(
     "INSPECTOR_SHEET_NAME", "ПБ, АР,ММГН, АГО (2025)"
 )
 
+# ----------------- ЖЁСТКО ЗАДАННЫЕ АДМИНЫ -----------------
+# Эти user_id всегда имеют права администратора, независимо от БД.
+HARD_CODED_ADMINS = {398960707}  # @asdinamitif
+
+def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь администратором (жёсткая проверка)."""
+    return user_id in HARD_CODED_ADMINS
+
 # Кэши Excel
 SCHEDULE_CACHE: Dict[str, Any] = {"mtime": None, "df": None}
 REMARKS_CACHE: Dict[str, Any] = {"mtime": None, "df": None}
@@ -441,161 +449,14 @@ def get_schedule_version(settings: dict) -> int:
         return 1
 
 
-def is_admin(user_id: int) -> bool:
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row is not None
-
-
-# ----------------- УПРАВЛЕНИЕ АДМИНИСТРАТОРАМИ -----------------
-def get_admins_list() -> List[Dict[str, Any]]:
-    conn = get_db()
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT user_id, username, first_seen_at FROM admins ORDER BY first_seen_at")
-    rows = c.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def add_admin_to_db(user_id: int, username: Optional[str]) -> None:
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        """ INSERT OR IGNORE INTO admins (user_id, username, first_seen_at)
-            VALUES (?, ?, COALESCE((SELECT first_seen_at FROM admins WHERE user_id=?), ?)) """,
-        (user_id, username or "", user_id, local_now().isoformat()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def delete_admin_from_db(user_id: int) -> int:
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
-    deleted = c.rowcount
-    conn.commit()
-    conn.close()
-    return deleted
-
+# ----------------- УПРАВЛЕНИЕ АДМИНАМИ (ТОЛЬКО СПРАВОЧНО) -----------------
+# Все проверки admin выполняются через HARD_CODED_ADMINS, но команды /admins и т.п. оставлены для удобства.
 
 async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not is_admin(user.id):
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("Команда доступна только администраторам.")
         return
-    admins = get_admins_list()
-    if not admins:
-        await update.message.reply_text("Администраторы ещё не назначены.")
-        return
-    lines = ["Список администраторов:", ""]
-    for a in admins:
-        uid = a.get("user_id")
-        uname = a.get("username") or ""
-        ts = a.get("first_seen_at") or "-"
-        uname_str = f"@{uname}" if uname else "-"
-        lines.append(f"• {uid} {uname_str} (с {ts})")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def cmd_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.message.reply_text("Команда доступна только администраторам.")
-        return
-    msg = update.message
-    if msg is None:
-        return
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        u = msg.reply_to_message.from_user
-        add_admin_to_db(u.id, u.username)
-        uname_str = f"@{u.username}" if u.username else str(u.id)
-        await msg.reply_text(f"Пользователь {uname_str} добавлен в администраторы.")
-        return
-    if context.args and context.args[0].isdigit():
-        uid = int(context.args[0])
-        add_admin_to_db(uid, None)
-        await msg.reply_text(f"Пользователь {uid} добавлен в администраторы.")
-        return
-    await msg.reply_text(
-        "Использование:\n"
-        "1) ответьте на сообщение пользователя и отправьте /add_admin\n"
-        "2) или: /add_admin <user_id>"
-    )
-
-
-async def cmd_del_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.message.reply_text("Команда доступна только администраторам.")
-        return
-    msg = update.message
-    if msg is None:
-        return
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        u = msg.reply_to_message.from_user
-        deleted = delete_admin_from_db(u.id)
-        if deleted:
-            uname_str = f"@{u.username}" if u.username else str(u.id)
-            await msg.reply_text(f"Пользователь {uname_str} удалён из администраторов.")
-        else:
-            await msg.reply_text("Этого пользователя нет в списке администраторов.")
-        return
-    if context.args and context.args[0].isdigit():
-        uid = int(context.args[0])
-        deleted = delete_admin_from_db(uid)
-        if deleted:
-            await msg.reply_text(f"Пользователь {uid} удалён из администраторов.")
-        else:
-            await msg.reply_text("Этого пользователя нет в списке администраторов.")
-        return
-    await msg.reply_text(
-        "Использование:\n"
-        "1) ответьте на сообщение пользователя и отправьте /del_admin\n"
-        "2) или: /del_admin <user_id>"
-    )
-
-
-def register_user(user) -> None:
-    if not user:
-        return
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, first_seen_at) VALUES (?, ?, ?)",
-        (user.id, user.username or "", local_now().isoformat()),
-    )
-    c.execute(
-        "UPDATE users SET username = ? WHERE user_id = ?",
-        (user.username or "", user.id),
-    )
-    conn.commit()
-    conn.close()
-
-
-async def ensure_admin(update: Update) -> bool:
-    user = update.effective_user
-    if not user:
-        return False
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) AS c FROM admins")
-    count = c.fetchone()["c"]
-    if count == 0:
-        c.execute(
-            "INSERT OR IGNORE INTO admins (user_id, username, first_seen_at) VALUES (?, ?, ?)",
-            (user.id, user.username or "", local_now().isoformat()),
-        )
-        conn.commit()
-        conn.close()
-        log.info("Первый пользователь %s стал админом", user.id)
-        return True
-    conn.close()
-    return False
+    await update.message.reply_text("Администраторы заданы жёстко в коде:\n• @asdinamitif (398960707)")
 
 
 # ----------------- КНОПКИ -----------------
@@ -779,11 +640,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
         return
-    register_user(user)
-    became_admin = await ensure_admin(update)
     msg = "Привет! Это бот отдела СОТ.\n"
-    if became_admin:
-        msg += "Вы назначены администратором бота.\n"
+    if is_admin(user.id):
+        msg += "Вы — администратор бота (жёстко задано в коде).\n"
     msg += "Выберите раздел на клавиатуре ниже."
     await update.message.reply_text(msg, reply_markup=main_menu())
 
@@ -1973,8 +1832,6 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("id", id_cmd))
     application.add_handler(CommandHandler("admins", cmd_admins))
-    application.add_handler(CommandHandler("add_admin", cmd_add_admin))
-    application.add_handler(CommandHandler("del_admin", cmd_del_admin))
 
     # Меню (клавиатура)
     application.add_handler(MessageHandler(filters.Regex("^📅 График$"), handle_menu_schedule))
