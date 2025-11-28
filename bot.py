@@ -10,6 +10,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 from openpyxl import load_workbook
+from urllib.parse import urlencode
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -47,10 +48,10 @@ SCHEDULE_PATH = os.getenv("SCHEDULE_PATH", "График выездов отде
 # 2-й файл: для 📝 Замечания и 🏗 ОНзС
 REMARKS_PATH = os.getenv("REMARKS_PATH", "График выездов отдела СОТ.xlsx")
 
-# URL для скачивания Excel с замечаниями (Яндекс.Диск)
+# URL для скачивания Excel с замечаниями (Яндекс.Диск – публичная ссылка)
 REMARKS_URL = os.getenv("REMARKS_URL", "").strip()
 
-# TTL авто-синхронизации (сек)
+# TTL авто-синхронизации (сек) – сейчас не используется, оставлен на будущее
 REMARKS_SYNC_TTL_SEC = int(os.getenv("REMARKS_SYNC_TTL_SEC", "3600"))
 
 TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "3"))  # МСК: +3
@@ -59,7 +60,7 @@ ANALYTICS_PASSWORD = "051995"
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# Дефолтный список возможных согласующих
+# Дефолтный список возможных согласующих (на будущее)
 DEFAULT_APPROVERS = [
     "@asdinamitif",
     "@FrolovAlNGSN",
@@ -74,7 +75,7 @@ INSPECTOR_SHEET_NAME = os.getenv(
     "INSPECTOR_SHEET_NAME", "ПБ, АР,ММГН, АГО (2025)"
 )
 
-# Для назначения прав в «Замечаниях»
+# Для назначения прав в «Замечаниях» (пока не используется, оставлено)
 RESPONSIBLE_USERNAMES = {
     "бектяшкин": ["sergeybektiashkin"],
     "смирнов": ["scri4"],
@@ -96,7 +97,7 @@ def local_now() -> datetime:
 def load_excel_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFrame]:
     """
     Загрузка Excel для раздела «📅 График» (только 1 лист).
-    С кэшированием по mtime.
+    С кэшированием по mtime. Если файл не Excel – возвращаем None.
     """
     if not os.path.exists(path):
         return None
@@ -107,7 +108,14 @@ def load_excel_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFrame
 
     log.info("Загружаю Excel (График): %s", path)
 
-    raw = pd.read_excel(path, sheet_name=0, header=None)
+    try:
+        raw = pd.read_excel(path, sheet_name=0, header=None)
+    except ValueError as e:
+        log.warning("Файл %s не похож на Excel (%s)", path, e)
+        return None
+    except Exception as e:
+        log.warning("Ошибка чтения Excel %s: %s", path, e)
+        return None
 
     header_row = 0
     for i in range(min(30, len(raw))):
@@ -116,14 +124,18 @@ def load_excel_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFrame
             header_row = i
             break
 
-    df = pd.read_excel(path, sheet_name=0, header=header_row)
+    try:
+        df = pd.read_excel(path, sheet_name=0, header=header_row)
+    except Exception as e:
+        log.warning("Ошибка повторного чтения Excel %s: %s", path, e)
+        return None
+
     df = df.dropna(how="all").reset_index(drop=True)
 
     cache["mtime"] = mtime
     cache["df"] = df
 
     log.info("График загружен: %s строк, %s столбцов", df.shape[0], df.shape[1])
-
     return df
 
 
@@ -133,6 +145,7 @@ def load_remarks_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFra
     • 📝 Замечания
     • 🏗 ОНзС
     Читаются ВСЕ листы (2023/2024/2025).
+    Если файл не Excel – возвращаем None.
     """
     if not os.path.exists(path):
         return None
@@ -143,7 +156,15 @@ def load_remarks_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFra
 
     log.info("Загружаю REMARKS (все листы): %s", path)
 
-    xls = pd.ExcelFile(path)
+    try:
+        xls = pd.ExcelFile(path)
+    except ValueError as e:
+        log.warning("REMARKS файл %s не похож на Excel (%s)", path, e)
+        return None
+    except Exception as e:
+        log.warning("Ошибка открытия REMARKS %s: %s", path, e)
+        return None
+
     frames = []
 
     for sheet in xls.sheet_names:
@@ -177,72 +198,91 @@ def load_remarks_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFra
     cache["df"] = df_all
 
     log.info("REMARKS загружен: %s строк, %s столбцов", df_all.shape[0], df_all.shape[1])
-
     return df_all
 
 
 def download_remarks_if_needed() -> None:
     """
-    Авто-синхронизация REMARKS_PATH с REMARKS_URL.
-    Если файл:
-    — отсутствует
-    — устарел (mtime > TTL)
-    → скачиваем с Яндекс.Диска (публичная ссылка)
+    Авто-синхронизация REMARKS_PATH с REMARKS_URL (Яндекс.Диск).
+
+    Логика:
+    - если REMARKS_URL не задан -> ничего не делаем;
+    - если файл уже есть локально -> считаем его основным и НЕ перезаписываем;
+    - если файла нет -> через API Яндекса берём прямую ссылку и скачиваем Excel.
     """
     if not REMARKS_URL:
         return
 
-    need = False
-
-    if not os.path.exists(REMARKS_PATH):
-        need = True
-    else:
-        try:
-            mtime = os.path.getmtime(REMARKS_PATH)
-            age = time_module.time() - mtime
-            if age > REMARKS_SYNC_TTL_SEC:
-                need = True
-        except Exception:
-            need = True
-
-    if not need:
+    # Если файл уже есть, не трогаем его (мог быть загружен через Telegram)
+    if os.path.exists(REMARKS_PATH):
         return
 
     try:
         log.info("Скачиваю REMARKS из Яндекс.Диска…")
-        resp = requests.get(REMARKS_URL, timeout=30)
-        resp.raise_for_status()
+
+        # 1) Получаем прямую ссылку через cloud-api
+        api_url = (
+            "https://cloud-api.yandex.net/v1/disk/public/resources/download?"
+            + urlencode({"public_key": REMARKS_URL})
+        )
+        meta_resp = requests.get(api_url, timeout=30)
+        meta_resp.raise_for_status()
+        data = meta_resp.json()
+        href = data.get("href")
+        if not href:
+            log.warning("Яндекс.Диск не вернул href. Ответ: %s", str(data)[:300])
+            return
+
+        # 2) Качаем уже сам файл Excel по href
+        file_resp = requests.get(href, timeout=60)
+        file_resp.raise_for_status()
 
         with open(REMARKS_PATH, "wb") as f:
-            f.write(resp.content)
+            f.write(file_resp.content)
 
         REMARKS_CACHE["mtime"] = None
         REMARKS_CACHE["df"] = None
-        log.info("REMARKS обновлён.")
+        log.info("REMARKS успешно загружен из Яндекс.Диска в %s.", REMARKS_PATH)
 
     except Exception as e:
-        log.warning("Ошибка загрузки REMARKS из URL: %s", e)
+        log.warning("Ошибка загрузки REMARKS из Яндекс.Диска: %s", e)
 
 
 def download_remarks_force() -> bool:
-    """Принудительное обновление (по кнопке «Обновить из Яндекс.Диска»)."""
+    """
+    Принудительное обновление (по кнопке «Обновить из Яндекс.Диска»).
+    Сейчас не используется, оставлено на будущее.
+    """
     if not REMARKS_URL:
         return False
 
     try:
         log.info("Принудительная загрузка REMARKS…")
-        resp = requests.get(REMARKS_URL, timeout=30)
-        resp.raise_for_status()
+
+        api_url = (
+            "https://cloud-api.yandex.net/v1/disk/public/resources/download?"
+            + urlencode({"public_key": REMARKS_URL})
+        )
+        meta_resp = requests.get(api_url, timeout=30)
+        meta_resp.raise_for_status()
+        data = meta_resp.json()
+        href = data.get("href")
+        if not href:
+            log.warning("Яндекс.Диск не вернул href при принудительной загрузке.")
+            return False
+
+        file_resp = requests.get(href, timeout=60)
+        file_resp.raise_for_status()
 
         with open(REMARKS_PATH, "wb") as f:
-            f.write(resp.content)
+            f.write(file_resp.content)
 
         REMARKS_CACHE["mtime"] = None
         REMARKS_CACHE["df"] = None
         return True
 
     except Exception as e:
-        log.warning("Ошибка принудительной загрузки: %s", e)
+        log.warning("Ошибка принудительной загрузки REMARKS: %s", e)
         return False
 
 
@@ -411,7 +451,7 @@ def init_db() -> None:
         """
     )
 
-    # Метаданные файла 📅 Графика
+    # Метаданные файла 📅 Графика (на будущее)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS schedule_meta (
@@ -424,7 +464,7 @@ def init_db() -> None:
         """
     )
 
-    # История согласований графика
+    # История согласований графика (на будущее)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS schedule_approvals (
@@ -436,7 +476,7 @@ def init_db() -> None:
         """
     )
 
-    # История загрузок файлов 📝 Замечаний
+    # История загрузок файлов 📝 Замечаний (на будущее)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS remarks_history (
@@ -928,61 +968,20 @@ def main() -> None:
     application.add_handler(CommandHandler("del_admin", cmd_del_admin))
 
     # --- CallbackQuery (inline-кнопки) ---
-
-    # 📅 График – все callback_data, начинающиеся с "schedule_"
-    application.add_handler(
-        CallbackQueryHandler(schedule_cb, pattern=r"^schedule_")
-    )
-
-    # 📝 Замечания – "remarks_*"
-    application.add_handler(
-        CallbackQueryHandler(remarks_cb, pattern=r"^remarks_")
-    )
-
-    # 🏗 ОНзС – выбор номера (onzs_1, onzs_2, ...)
-    application.add_handler(
-        CallbackQueryHandler(onzs_cb, pattern=r"^onzs_[0-9]+$")
-    )
-
-    # 🏗 ОНзС – выбор периода (onzsperiod:...)
-    application.add_handler(
-        CallbackQueryHandler(onzs_period_cb, pattern=r"^onzsperiod:")
-    )
-
-    # Статусы ПБ/ПБ ЗК КНД/АР/… и прикрепление файлов: note_* и attach_*
-    application.add_handler(
-        CallbackQueryHandler(notes_status_cb, pattern=r"^(note_|attach_)")
-    )
-
-    # Инспектор – мастер добавления выезда (insp_add_trip и др. в будущем)
-    application.add_handler(
-        CallbackQueryHandler(inspector_cb, pattern=r"^insp_")
-    )
+    application.add_handler(CallbackQueryHandler(schedule_cb, pattern=r"^schedule_"))
+    application.add_handler(CallbackQueryHandler(remarks_cb, pattern=r"^remarks_"))
+    application.add_handler(CallbackQueryHandler(onzs_cb, pattern=r"^onzs_[0-9]+$"))
+    application.add_handler(CallbackQueryHandler(onzs_period_cb, pattern=r"^onzsperiod:"))
+    application.add_handler(CallbackQueryHandler(notes_status_cb, pattern=r"^(note_|attach_)"))
+    application.add_handler(CallbackQueryHandler(inspector_cb, pattern=r"^insp_"))
 
     # --- Документы / фото ---
+    application.add_handler(MessageHandler(filters.PHOTO, attachment_handler))
+    application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
 
-    # Фото
+    # --- Обычный текст ---
     application.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            attachment_handler,
-        )
-    )
-
-    # Документы (в том числе Excel)
-    application.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            document_handler,
-        )
-    )
-
-    # --- Обычный текст (кнопки меню и пошаговые мастера) ---
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text_router,
-        )
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_router)
     )
 
     # --- Ошибки ---
