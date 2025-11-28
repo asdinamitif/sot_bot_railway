@@ -80,6 +80,9 @@ RESPONSIBLE_USERNAMES = {
     "смирнов": ["scri4"],
 }
 
+# Дефолтные админы по username (без @) – ты в списке
+DEFAULT_ADMIN_USERNAMES = ["asdinamitif"]
+
 # Кэш для Excel
 SCHEDULE_CACHE: Dict[str, Any] = {"mtime": None, "df": None}
 REMARKS_CACHE: Dict[str, Any] = {"mtime": None, "df": None}
@@ -447,11 +450,17 @@ def init_db() -> None:
         """
     )
 
-    # Если ADMIN_ID задан – добавим в таблицу admins
-    if ADMIN_ID != 0:
-        # username мы не знаем, поэтому можно хранить как специальную запись,
-        # но для простоты пока не добавляем – админ будет управлять через /add_admin
-        pass
+    # Если список админов пуст – добавим дефолтных
+    cur.execute("SELECT COUNT(*) FROM admins;")
+    row = cur.fetchone()
+    count = row[0] if row else 0
+
+    if count == 0:
+        for uname in DEFAULT_ADMIN_USERNAMES:
+            cur.execute(
+                "INSERT OR IGNORE INTO admins (username) VALUES (?);",
+                (uname,),
+            )
 
     conn.commit()
     conn.close()
@@ -604,7 +613,6 @@ async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text("Файл графика не найден или не читается.")
         return
 
-    # Простой пример: показать первые 5 строк с датами
     text_lines = ["Первые 5 выездов из графика:"]
     head = df.head(5)
     date_col = find_col(head, ["дата выезда", "дата"])
@@ -701,23 +709,49 @@ def build_inspector_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb)
 
 
-# ----------------- ОБРАБОТЧИК ДОКУМЕНТОВ/ФОТО -----------------
+# ----------------- ОБРАБОТЧИК ПРИКРЕПЛЕНИЙ (ФОТО) -----------------
 async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Обработчик фото / файлов, которые пользователь отправляет.
-    Пока только подтверждаем получение.
+    Обработчик фото, которые пользователь отправляет.
     """
     message = update.effective_message
-    await message.reply_text("Файл/фото получен. Логика прикрепления к строкам пока упрощена.")
+    await message.reply_text("Фото получено. Логика привязки к строкам пока упрощена.")
 
 
+# ----------------- ОБРАБОТЧИК ДОКУМЕНТОВ (Excel и др.) -----------------
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Отдельный обработчик документов (например, Excel).
-    В упрощённой версии просто отвечаем, что файл получен.
+    Если прилетел Excel (.xlsx / .xlsm / .xls) — сохраняем как рабочий файл
+    (и для 📅 Графика, и для 📝 Замечаний, так как пути по умолчанию совпадают).
+    Остальные файлы просто подтверждаем.
     """
+    if not update.message or not update.message.document:
+        return
+
     doc: Document = update.message.document
-    await update.message.reply_text(f"Получен файл: {doc.file_name}")
+    file_name = doc.file_name or "file"
+    lower_name = file_name.lower()
+
+    # Определяем, Excel ли это
+    if lower_name.endswith((".xlsx", ".xlsm", ".xls")):
+        tg_file = await doc.get_file()
+        save_path = REMARKS_PATH  # он же по умолчанию для графика
+
+        await tg_file.download_to_drive(custom_path=save_path)
+
+        # Сброс кэша, чтобы при следующем запросе бот перечитал файл
+        SCHEDULE_CACHE["mtime"] = None
+        SCHEDULE_CACHE["df"] = None
+        REMARKS_CACHE["mtime"] = None
+        REMARKS_CACHE["df"] = None
+
+        await update.message.reply_text(
+            f"Файл «{file_name}» сохранён как рабочий Excel бота.\n"
+            f"Теперь разделы «📅 График» и «📝 Замечания» читают данные из него."
+        )
+        return
+
+    await update.message.reply_text(f"Получен файл: {file_name}")
 
 
 # ----------------- РОУТЕР ТЕКСТА -----------------
@@ -927,15 +961,15 @@ def main() -> None:
 
     # --- Документы / фото ---
 
-    # Сначала обработчик прикреплений к строкам (📎 Прикрепить файл)
+    # Фото
     application.add_handler(
         MessageHandler(
-            filters.PHOTO | filters.Document.ALL,
+            filters.PHOTO,
             attachment_handler,
         )
     )
 
-    # Затем – загрузка Excel-файлов (график / рабочий файл)
+    # Документы (в том числе Excel)
     application.add_handler(
         MessageHandler(
             filters.Document.ALL,
