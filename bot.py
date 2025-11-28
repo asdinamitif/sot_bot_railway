@@ -33,7 +33,8 @@ log = logging.getLogger("sot_bot")
 # ----------------- ENV / НАСТРОЙКИ -----------------
 load_dotenv()
 
-BOT_TOKEN = "8274616381:AAE4Av9RgX8iSRfM1n2U9V8oPoWAf-bB_hA"
+# Токен теперь берём из окружения (на Railway → Variables → BOT_TOKEN)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 DB_PATH = os.getenv("DB_PATH", "sot_bot.db")
 
@@ -374,6 +375,133 @@ def is_admin(user_id: int) -> bool:
     row = c.fetchone()
     conn.close()
     return row is not None
+
+
+# ----------------- УПРАВЛЕНИЕ АДМИНИСТРАТОРАМИ -----------------
+def get_admins_list() -> List[Dict[str, Any]]:
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT user_id, username, first_seen_at FROM admins ORDER BY first_seen_at")
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_admin_to_db(user_id: int, username: Optional[str]) -> None:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT OR IGNORE INTO admins (user_id, username, first_seen_at)
+        VALUES (?, ?, COALESCE((SELECT first_seen_at FROM admins WHERE user_id=?), ?))
+        """,
+        (user_id, username or "", user_id, local_now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_admin_from_db(user_id: int) -> int:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
+    deleted = c.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("Команда доступна только администраторам.")
+        return
+
+    admins = get_admins_list()
+    if not admins:
+        await update.message.reply_text("Администраторы ещё не назначены.")
+        return
+
+    lines = ["Список администраторов:", ""]
+    for a in admins:
+        uid = a.get("user_id")
+        uname = a.get("username") or ""
+        ts = a.get("first_seen_at") or "-"
+        uname_str = f"@{uname}" if uname else "-"
+        lines.append(f"• {uid} {uname_str} (с {ts})")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("Команда доступна только администраторам.")
+        return
+
+    msg = update.message
+    if msg is None:
+        return
+
+    # Вариант 1 — ответ на сообщение пользователя
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        add_admin_to_db(u.id, u.username)
+        uname_str = f"@{u.username}" if u.username else str(u.id)
+        await msg.reply_text(f"Пользователь {uname_str} добавлен в администраторы.")
+        return
+
+    # Вариант 2 — /add_admin 123456789
+    if context.args and context.args[0].isdigit():
+        uid = int(context.args[0])
+        add_admin_to_db(uid, None)
+        await msg.reply_text(f"Пользователь {uid} добавлен в администраторы.")
+        return
+
+    await msg.reply_text(
+        "Использование:\n"
+        "1) ответьте на сообщение пользователя и отправьте /add_admin\n"
+        "2) или: /add_admin <user_id>"
+    )
+
+
+async def cmd_del_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("Команда доступна только администраторам.")
+        return
+
+    msg = update.message
+    if msg is None:
+        return
+
+    # Вариант 1 — ответ на сообщение
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        deleted = delete_admin_from_db(u.id)
+        if deleted:
+            uname_str = f"@{u.username}" if u.username else str(u.id)
+            await msg.reply_text(f"Пользователь {uname_str} удалён из администраторов.")
+        else:
+            await msg.reply_text("Этого пользователя нет в списке администраторов.")
+        return
+
+    # Вариант 2 — /del_admin 123456789
+    if context.args and context.args[0].isdigit():
+        uid = int(context.args[0])
+        deleted = delete_admin_from_db(uid)
+        if deleted:
+            await msg.reply_text(f"Пользователь {uid} удалён из администраторов.")
+        else:
+            await msg.reply_text("Этого пользователя нет в списке администраторов.")
+        return
+
+    await msg.reply_text(
+        "Использование:\n"
+        "1) ответьте на сообщение пользователя и отправьте /del_admin\n"
+        "2) или: /del_admin <user_id>"
+    )
 
 
 def register_user(user) -> None:
@@ -2024,7 +2152,7 @@ async def handle_analytics_password(
 # ----------------- MAIN -----------------
 def main() -> None:
     if not BOT_TOKEN:
-        raise SystemExit("Укажи BOT_TOKEN в коде")
+        raise SystemExit("Укажи BOT_TOKEN в переменных окружения или .env")
 
     init_db()
 
@@ -2033,6 +2161,9 @@ def main() -> None:
     # Команды
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("id", id_cmd))
+    application.add_handler(CommandHandler("admins", cmd_admins))
+    application.add_handler(CommandHandler("add_admin", cmd_add_admin))
+    application.add_handler(CommandHandler("del_admin", cmd_del_admin))
 
     # Меню (клавиатура)
     application.add_handler(
