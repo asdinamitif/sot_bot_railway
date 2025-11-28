@@ -38,13 +38,24 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DB_PATH = os.getenv("DB_PATH", "sot_bot.db")
+
+# 1-й файл: для 📅 График и 📊 Итоговая
 SCHEDULE_PATH = os.getenv("SCHEDULE_PATH", "График выездов отдела СОТ.xlsx")
-REMARKS_PATH = os.getenv("REMARKS_PATH", "График выездов отдела СОТ.xlsx")
+# 2-й файл: для 📝 Замечания и 🏗 ОНзС — по умолчанию тот же, что и SCHEDULE_PATH
+REMARKS_PATH = os.getenv("REMARKS_PATH", SCHEDULE_PATH)
+
+# URL и TTL для авто-синхронизации графика
+SCHEDULE_URL = os.getenv("SCHEDULE_URL", "").strip()
+SCHEDULE_SYNC_TTL_SEC = int(os.getenv("SCHEDULE_SYNC_TTL_SEC", "3600"))
+
+# URL и TTL для авто-синхронизации замечаний
 REMARKS_URL = os.getenv("REMARKS_URL", "").strip()
 REMARKS_SYNC_TTL_SEC = int(os.getenv("REMARKS_SYNC_TTL_SEC", "3600"))
+
 TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "3"))  # МСК: +3
 ANALYTICS_PASSWORD = "051995"
 
+# стандартный список согласующих (кнопки)
 DEFAULT_APPROVERS = [
     "@asdinamitif",
     "@FrolovAlNGSN",
@@ -54,6 +65,7 @@ DEFAULT_APPROVERS = [
     "@Kirill_Victorovi4",
 ]
 
+# Для прав на замечания по ФИО в столбце K
 RESPONSIBLE_USERNAMES = {
     "бектяшкин": ["sergeybektiashkin"],
     "смирнов": ["scri4"],
@@ -139,7 +151,42 @@ def load_remarks_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFra
     return df_all
 
 
+def download_schedule_if_needed() -> None:
+    """Автоматическая загрузка файла графика из SCHEDULE_URL, если он отсутствует или устарел."""
+    if not SCHEDULE_URL:
+        return
+
+    need_download = False
+    if not os.path.exists(SCHEDULE_PATH):
+        need_download = True
+    else:
+        try:
+            mtime = os.path.getmtime(SCHEDULE_PATH)
+            age = time_module.time() - mtime
+            if age > SCHEDULE_SYNC_TTL_SEC:
+                need_download = True
+        except Exception as e:
+            log.warning("Не удалось проверить возраст SCHEDULE_PATH: %s", e)
+            need_download = True
+
+    if not need_download:
+        return
+
+    try:
+        log.info("Скачиваю файл графика из SCHEDULE_URL (авто-синхронизация)...")
+        resp = requests.get(SCHEDULE_URL, timeout=30)
+        resp.raise_for_status()
+        with open(SCHEDULE_PATH, "wb") as f:
+            f.write(resp.content)
+        SCHEDULE_CACHE["mtime"] = None
+        SCHEDULE_CACHE["df"] = None
+        log.info("Файл графика успешно скачан и сохранён в %s", SCHEDULE_PATH)
+    except Exception as e:
+        log.warning("Не удалось скачать файл графика из SCHEDULE_URL: %s", e)
+
+
 def get_schedule_df() -> Optional[pd.DataFrame]:
+    download_schedule_if_needed()
     return load_excel_cached(SCHEDULE_PATH, SCHEDULE_CACHE)
 
 
@@ -818,6 +865,7 @@ async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text("Отправьте Excel (.xlsx) с графиком.", reply_markup=None)
         return
     if data == "schedule_download":
+        download_schedule_if_needed()
         if not os.path.exists(SCHEDULE_PATH):
             await query.edit_message_text("Файл графика ещё не загружен.")
             return
