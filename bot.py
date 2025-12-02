@@ -79,9 +79,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-credentials = Credentials.from_service_account_file(
-    GOOGLE_CREDS_FILE,
-    scopes=SCOPES
+# Берём JSON сервисного аккаунта из переменной окружения Railway: sot_bot_railway
+service_account_info = json.loads(os.getenv("sot_bot_railway"))
+
+credentials = service_account.Credentials.from_service_account_info(
+    service_account_info,
+    scopes=SCOPES,
 )
 
 # Клиенты Sheets и Drive
