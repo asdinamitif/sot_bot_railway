@@ -92,7 +92,37 @@ def local_now() -> datetime:
     return datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
 
 
-# ----------------- РАБОТА С EXCEL -----------------
+# ----------------- РАБОТА С EXCEL / ЗАГРУЗКА ФАЙЛОВ -----------------
+def download_file_from_url(url: str) -> bytes:
+    """
+    Скачивает файл по URL.
+    Если это публичная ссылка Яндекс.Диска (disk.yandex.*),
+    сначала запрашивает прямой href через cloud-api.yandex.net.
+    """
+    if "disk.yandex" in url:
+        api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
+        try:
+            # 1. Получаем ссылку на скачивание по public_key (публичная ссылка)
+            resp = requests.get(api_url, params={"public_key": url}, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            href = data.get("href")
+            if not href:
+                raise RuntimeError("В ответе Яндекс.Диска нет поля 'href'")
+            # 2. Скачиваем сам файл по href
+            file_resp = requests.get(href, timeout=60)
+            file_resp.raise_for_status()
+            return file_resp.content
+        except Exception as e:
+            log.warning("Ошибка скачивания с Яндекс.Диска (%s): %s", url, e)
+            raise
+
+    # Обычный HTTP/HTTPS URL
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    return resp.content
+
+
 def load_excel_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFrame]:
     if not os.path.exists(path):
         return None
@@ -182,10 +212,9 @@ def download_schedule_if_needed() -> None:
 
     try:
         log.info("Скачиваю файл графика из SCHEDULE_URL (авто-синхронизация)...")
-        resp = requests.get(SCHEDULE_URL, timeout=30)
-        resp.raise_for_status()
+        content = download_file_from_url(SCHEDULE_URL)
         with open(SCHEDULE_PATH, "wb") as f:
-            f.write(resp.content)
+            f.write(content)
         SCHEDULE_CACHE["mtime"] = None
         SCHEDULE_CACHE["df"] = None
         log.info("Файл графика успешно скачан и сохранён в %s", SCHEDULE_PATH)
@@ -217,10 +246,9 @@ def download_remarks_if_needed() -> None:
         return
     try:
         log.info("Скачиваю файл замечаний из REMARKS_URL (авто-синхронизация)...")
-        resp = requests.get(REMARKS_URL, timeout=30)
-        resp.raise_for_status()
+        content = download_file_from_url(REMARKS_URL)
         with open(REMARKS_PATH, "wb") as f:
-            f.write(resp.content)
+            f.write(content)
         REMARKS_CACHE["mtime"] = None
         REMARKS_CACHE["df"] = None
         log.info("Файл замечаний успешно скачан и сохранён в %s", REMARKS_PATH)
@@ -1122,7 +1150,7 @@ async def handle_menu_remarks(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(
         "Раздел «Замечания».\n"
         "1) Через «⬆ Загрузить» админ загружает рабочий файл с замечаниями.\n"
-        "2) Если настроен REMARKS_URL, бот периодически подтягивает свежий файл из Google Sheets.\n"
+        "2) Если настроен REMARKS_URL, бот периодически подтягивает свежий файл из Яндекс.Диска или другого URL.\n"
         "3) Статусы «Устранены» / «Не устранены» / «Не требуется» берутся из столбцов Q, R, Y, AD.\n"
         "4) Через кнопки ниже выводятся списки по этим статусам.",
         reply_markup=remarks_menu_inline(),
@@ -1210,7 +1238,7 @@ async def remarks_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 if isinstance(dv, datetime):
                     date_str = dv.strftime("%d.%m.%Y")
                 elif dv:
-                    date_str = pd.to_datetime(dv).strftime("%d.%m.%Y")
+                    date_str = pd.to_datetime(dv).strftime("%d.%м.%Y")
             except Exception:
                 date_str = str(dv)
         if row_category == "done":
@@ -1744,7 +1772,7 @@ async def handle_inspector_step(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_menu_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["await_analytics_password"] = True
     await update.message.reply_text("Введите пароль для входа в раздел «Аналитика»:")
-
+    
 
 async def handle_analytics_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.user_data.get("await_analytics_password"):
