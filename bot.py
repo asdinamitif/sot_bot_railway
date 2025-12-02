@@ -1,15 +1,11 @@
-# ============================================
-#   SOT BOT — FULL MONOLITH VERSION (PART 1)
-#   Google Sheets + Google Drive + Telegram
-#   All-in-one bot.py
-# ============================================
-
 import os
 import logging
 import sqlite3
 import mimetypes
 from datetime import datetime, timedelta, date
 from typing import Optional, Dict, Any, List
+
+import json  # ← ДОБАВЬ ЭТО
 
 import requests
 import pandas as pd
@@ -33,7 +29,7 @@ from telegram.ext import (
 # Google API imports
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from google.oauth2.service_account import Credentials
+from google.oauth2 import service_account
 
 # --------------------------------------------
 #               LOGGING
@@ -52,7 +48,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ANALYTICS_PASSWORD = "051995"
 
 # Spreadsheet ID (нужно заменить на ваш реальный ID)
-SPREADSHEET_ID = "YOUR_SPREADSHEET_ID"
+SPREADSHEET_ID = "1FlhN7grvku5tSj2SAreEHxHC55K9E7N91r8eWOkzOFY"
 
 # Названия листов
 SHEET_REMARKS = "ПБ, АР,ММГН, АГО (2025)"
@@ -69,18 +65,28 @@ COL_EOM_STATUS = "AD"
 #       GOOGLE API — ИНИЦИАЛИЗАЦИЯ
 # --------------------------------------------
 
-GOOGLE_CREDS_FILE = "credentials.json"
-
-if not os.path.exists(GOOGLE_CREDS_FILE):
-    raise SystemExit("credentials.json не найден. Загрузите его в проект!")
-
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/drive",
 ]
 
 # Берём JSON сервисного аккаунта из переменной окружения Railway: sot_bot_railway
-service_account_info = json.loads(os.getenv("sot_bot_railway"))
+service_account_json = os.getenv("sot_bot_railway")
+
+if not service_account_json:
+    raise SystemExit(
+        "Переменная окружения 'sot_bot_railway' не задана.\n"
+        "Скопируй полный JSON сервисного аккаунта в Variables Railway "
+        "под именем 'sot_bot_railway'."
+    )
+
+try:
+    service_account_info = json.loads(service_account_json)
+except json.JSONDecodeError:
+    raise SystemExit(
+        "Переменная 'sot_bot_railway' содержит некорректный JSON. "
+        "Проверь, что ты вставил туда содержимое .json-файла сервисного аккаунта целиком."
+    )
 
 credentials = service_account.Credentials.from_service_account_info(
     service_account_info,
