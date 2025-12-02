@@ -1,1 +1,6 @@
-{"deploy":{"startCommand":"python bot.py","restartPolicyType":"ALWAYS"}}
+{
+  "deploy": {
+    "startCommand": "sh -c \"echo \\\"$sot_bot_railway\\\" > credentials.json && python3 bot.py\"",
+    "restartPolicyType": "ALWAYS"
+  }
+}
