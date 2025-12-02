@@ -79,9 +79,11 @@ INSPECTOR_SHEET_NAME = os.getenv(
 # Эти user_id всегда имеют права администратора, независимо от БД.
 HARD_CODED_ADMINS = {398960707}  # @asdinamitif
 
+
 def is_admin(user_id: int) -> bool:
     """Проверяет, является ли пользователь администратором (жёсткая проверка)."""
     return user_id in HARD_CODED_ADMINS
+
 
 # Кэши Excel
 SCHEDULE_CACHE: Dict[str, Any] = {"mtime": None, "df": None}
@@ -92,37 +94,43 @@ def local_now() -> datetime:
     return datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
 
 
-# ----------------- РАБОТА С EXCEL / ЗАГРУЗКА ФАЙЛОВ -----------------
+# ----------------- ПОМОЩНИК ДЛЯ ЗАГРУЗКИ ФАЙЛОВ ПО URL -----------------
 def download_file_from_url(url: str) -> bytes:
     """
-    Скачивает файл по URL.
-    Если это публичная ссылка Яндекс.Диска (disk.yandex.*),
-    сначала запрашивает прямой href через cloud-api.yandex.net.
+    Универсальная загрузка файла по URL.
+
+    Особый случай: публичная ссылка Яндекс.Диска вида
+    https://disk.yandex.ru/i/... или https://disk.yandex.by/i/...
+    В этом случае используем официальный API:
+    GET https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key=<URL>
+    -> {"href": "..."} -> скачиваем по href.
     """
-    if "disk.yandex" in url:
-        api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
-        try:
-            # 1. Получаем ссылку на скачивание по public_key (публичная ссылка)
-            resp = requests.get(api_url, params={"public_key": url}, timeout=30)
+    try:
+        if "disk.yandex" in url and "/i/" in url:
+            api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
+            params = {"public_key": url}
+            log.info("Пробую скачать файл через API Яндекс.Диска: %s", url)
+            resp = requests.get(api_url, params=params, timeout=30)
             resp.raise_for_status()
             data = resp.json()
             href = data.get("href")
             if not href:
-                raise RuntimeError("В ответе Яндекс.Диска нет поля 'href'")
-            # 2. Скачиваем сам файл по href
+                raise RuntimeError("В ответе API Яндекс.Диска нет поля 'href'")
             file_resp = requests.get(href, timeout=60)
             file_resp.raise_for_status()
             return file_resp.content
-        except Exception as e:
-            log.warning("Ошибка скачивания с Яндекс.Диска (%s): %s", url, e)
-            raise
 
-    # Обычный HTTP/HTTPS URL
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    return resp.content
+        # Обычный случай — прямой URL на файл
+        log.info("Скачиваю файл по прямому URL: %s", url)
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as e:
+        log.warning("Не удалось скачать файл по URL %s: %s", url, e)
+        raise
 
 
+# ----------------- РАБОТА С EXCEL -----------------
 def load_excel_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFrame]:
     if not os.path.exists(path):
         return None
@@ -189,8 +197,9 @@ def load_remarks_cached(path: str, cache: Dict[str, Any]) -> Optional[pd.DataFra
     return df_all
 
 
-def download_schedule_if_needed() -> None:
-    """Автоматическая загрузка файла графика из SCHEDULE_URL, если он отсутствует или устарел."""
+def download_schedule_if_needed(force: bool = False) -> None:
+    """Автозагрузка файла графика из SCHEDULE_URL, если он отсутствует или устарел.
+    Если force=True — скачиваем в любом случае (например, при «⬇ Скачать»)."""
     if not SCHEDULE_URL:
         return
 
@@ -207,7 +216,7 @@ def download_schedule_if_needed() -> None:
             log.warning("Не удалось проверить возраст SCHEDULE_PATH: %s", e)
             need_download = True
 
-    if not need_download:
+    if not need_download and not force:
         return
 
     try:
@@ -228,6 +237,7 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
 
 
 def download_remarks_if_needed() -> None:
+    """Автозагрузка REMARKS_PATH из REMARKS_URL (аналогично графику)."""
     if not REMARKS_URL:
         return
     need_download = False
@@ -752,7 +762,8 @@ async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text("Отправьте Excel (.xlsx) с графиком.", reply_markup=None)
         return
     if data == "schedule_download":
-        download_schedule_if_needed()
+        # форсируем обновление с SCHEDULE_URL (если задан)
+        download_schedule_if_needed(force=True)
         if not os.path.exists(SCHEDULE_PATH):
             await query.edit_message_text("Файл графика ещё не загружен.")
             return
@@ -1077,16 +1088,29 @@ async def handle_menu_final(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # --------- ЗАГРУЗКА Excel ---------
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик документов Excel для графика и рабочего файла.
+    ВАЖНО: срабатывает только когда мы реально ждём Excel
+    (await_schedule_file или await_remarks_file), чтобы не мешать
+    прикреплению файлов к ОНзС.
+    """
     msg = update.message
     if not msg or not msg.document:
         return
+
+    # Если бот НЕ ждёт загрузку графика/замечаний, ничего не делаем
+    if not (context.user_data.get("await_schedule_file") or context.user_data.get("await_remarks_file")):
+        return
+
     doc: Document = msg.document
     user = update.effective_user
     if not user:
         return
+
     if not doc.file_name.lower().endswith(".xlsx"):
         await msg.reply_text("Нужен файл в формате .xlsx")
         return
+
     if context.user_data.get("await_schedule_file"):
         if not is_admin(user.id):
             await msg.reply_text("Только администратор может загружать график.")
@@ -1129,6 +1153,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             reply_markup=build_schedule_inline(admin_flag, settings),
         )
         return
+
     if context.user_data.get("await_remarks_file"):
         if not is_admin(user.id):
             await msg.reply_text("Только администратор может загружать рабочий файл.")
@@ -1150,7 +1175,7 @@ async def handle_menu_remarks(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(
         "Раздел «Замечания».\n"
         "1) Через «⬆ Загрузить» админ загружает рабочий файл с замечаниями.\n"
-        "2) Если настроен REMARKS_URL, бот периодически подтягивает свежий файл из Яндекс.Диска или другого URL.\n"
+        "2) Если настроен REMARKS_URL, бот периодически подтягивает свежий файл из хранилища (например, Яндекс.Диск).\n"
         "3) Статусы «Устранены» / «Не устранены» / «Не требуется» берутся из столбцов Q, R, Y, AD.\n"
         "4) Через кнопки ниже выводятся списки по этим статусам.",
         reply_markup=remarks_menu_inline(),
@@ -1771,8 +1796,8 @@ async def handle_inspector_step(update: Update, context: ContextTypes.DEFAULT_TY
 # --------- 📈 АНАЛИТИКА ---------
 async def handle_menu_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["await_analytics_password"] = True
-    await update.message.reply_text("Введите пароль для входа в раздел «Аналитика»:")
-    
+    await update.message.reply_text("Введите пароль для входа в раздел «Аналитика»:")  
+
 
 async def handle_analytics_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.user_data.get("await_analytics_password"):
@@ -1877,10 +1902,10 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(notes_status_cb, pattern="^(note_|attach_)"))
     application.add_handler(CallbackQueryHandler(inspector_cb, pattern="^insp_"))
 
-    # Документы (Excel)
+    # Документы (Excel для графика/замечаний)
     application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
 
-    # Прикреплённые файлы к ОНзС
+    # Прикреплённые файлы к ОНзС (документы и фото)
     application.add_handler(MessageHandler((filters.Document.ALL | filters.PHOTO), attachment_handler))
 
     # Прочий текст
