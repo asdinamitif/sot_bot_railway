@@ -1,1 +1,10 @@
-sh -c "echo \"$sot_bot_railway\" > credentials.json && python3 bot.py"
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "dockerfile",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "startCommand": "python bot.py"
+  }
+}
