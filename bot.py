@@ -39,11 +39,18 @@ load_dotenv()
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "8274616381:AAE4Av9RgX8iSRfM1n2U9V8oPoWAf-bB_hA").strip()
 DB_PATH = os.getenv("DB_PATH", "sot_bot.db")
 
-SCHEDULE_URL = os.getenv("SCHEDULE_URL", "").strip()
+# По умолчанию используем твою Google-таблицу
+GOOGLE_SHEET_URL_DEFAULT = (
+    "https://docs.google.com/spreadsheets/d/"
+    "1FlhN7grvku5tSj2SAreEHxHC55K9E7N91r8eWOkzOFY/edit?usp=sharing"
+)
+
+SCHEDULE_URL = os.getenv("SCHEDULE_URL", GOOGLE_SHEET_URL_DEFAULT).strip()
 SCHEDULE_PATH = os.getenv("SCHEDULE_PATH", "schedule.xlsx")
 
-# Файл с замечаниями – работаем с remarks2.xlsx
-REMARKS_URL = os.getenv("REMARKS_URL", "").strip()  # можно не использовать
+# Файл с замечаниями – работаем с remarks2.xlsx, но при наличии REMARKS_URL
+# скачиваем его так же из Google/Яндекс
+REMARKS_URL = os.getenv("REMARKS_URL", GOOGLE_SHEET_URL_DEFAULT).strip()
 REMARKS_PATH = os.getenv("REMARKS_PATH", "remarks2.xlsx")
 
 SCHEDULE_SYNC_TTL_SEC = int(os.getenv("SCHEDULE_SYNC_TTL_SEC", "3600"))
@@ -66,9 +73,12 @@ RESPONSIBLE_USERNAMES = {
     "смирнов": ["scri4"],
 }
 
-INSPECTOR_SHEET_NAME = "ПБ, АР,ММГН, АГО (2025)"  # используется только для мастера инспектора
+INSPECTOR_SHEET_NAME = "ПБ, АР,ММГН, АГО (2025)"  # лист для мастера инспектора
 
 HARD_CODED_ADMINS = {398960707}
+
+# Группа для уведомлений по графику (можно задать через env или командой /set_schedule_group)
+SCHEDULE_NOTIFY_CHAT_ID_ENV = os.getenv("SCHEDULE_NOTIFY_CHAT_ID", "").strip()
 
 
 def is_admin(uid: int) -> bool:
@@ -226,8 +236,6 @@ def load_excel_all_sheets(path: str, cache: Dict[str, Any]) -> Optional[pd.DataF
 
     if not frames:
         log.error("Excel прочитан, но листы пустые или нераспознаны.")
-        return None
-
     df_all = pd.concat(frames, ignore_index=True)
     cache["mtime"] = mtime
     cache["df"] = df_all
@@ -240,7 +248,9 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
 
 
 def get_remarks_df() -> Optional[pd.DataFrame]:
-    # remarks2.xlsx ведём руками, без автозагрузок по URL
+    # Теперь тоже умеем забирать из удалённого источника при наличии REMARKS_URL
+    if REMARKS_URL:
+        download_file_if_needed(REMARKS_URL, REMARKS_PATH, REMARKS_SYNC_TTL_SEC)
     return load_excel_all_sheets(REMARKS_PATH, REMARKS_CACHE)
 
 
@@ -276,6 +286,19 @@ def get_col_by_letter(df: pd.DataFrame, letters: str) -> Optional[str]:
 # ----------------- ИНСПЕКТОР: запись в Excel -----------------
 
 def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
+    """
+    Записываем в лист INSPECTOR_SHEET_NAME файла REMARKS_PATH:
+
+    B – Дата выезда
+    C – Дата начала итоговой проверки
+    D – Площадь / Этажность (одной ячейкой)
+    E – ОНзС
+    F – Наименование застройщика
+    G – Наименование объекта
+    H – Строительный адрес
+    I – Номер дела
+    J – Вид проверки
+    """
     if not os.path.exists(REMARKS_PATH):
         log.warning("REMARKS_PATH не найден, некуда сохранять выезд инспектора.")
         return False
@@ -292,6 +315,7 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
 
     ws = wb[INSPECTOR_SHEET_NAME]
 
+    # ищем последнюю заполненную строку по колонке B (дата выезда)
     last_data_row = 1
     max_row = ws.max_row or 1
     for r in range(1, max_row + 1):
@@ -301,21 +325,34 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
 
     new_row = last_data_row + 1
 
-    date_obj = form.get("date")
-    if isinstance(date_obj, datetime):
-        date_str = date_obj.strftime("%d.%m.%Y")
-    elif isinstance(date_obj, date):
-        date_str = date_obj.strftime("%d.%m.%Y")
+    # B: дата выезда
+    date_dep = form.get("date_departure")
+    if isinstance(date_dep, datetime):
+        dep_str = date_dep.strftime("%d.%m.%Y")
+    elif isinstance(date_dep, date):
+        dep_str = date_dep.strftime("%d.%m.%Y")
     else:
-        date_str = str(date_obj or "")
-    ws.cell(row=new_row, column=2).value = date_str
+        dep_str = str(date_dep or "")
+    ws.cell(row=new_row, column=2).value = dep_str
 
+    # C: дата начала итоговой проверки
+    date_fin = form.get("date_final")
+    if isinstance(date_fin, datetime):
+        fin_str = date_fin.strftime("%d.%m.%Y")
+    elif isinstance(date_fin, date):
+        fin_str = date_fin.strftime("%d.%m.%Y")
+    else:
+        fin_str = str(date_fin or "")
+    ws.cell(row=new_row, column=3).value = fin_str
+
+    # D: площадь + этажность
     area = form.get("area") or ""
     floors = form.get("floors") or ""
     ws.cell(row=new_row, column=4).value = (
         f"Площадь (кв.м): {area}\nКоличество этажей: {floors}"
     )
 
+    # E–J: остальные поля
     ws.cell(row=new_row, column=5).value = form.get("onzs") or ""
     ws.cell(row=new_row, column=6).value = form.get("developer") or ""
     ws.cell(row=new_row, column=7).value = form.get("object") or ""
@@ -412,6 +449,15 @@ def init_db() -> None:
            )"""
     )
 
+    # Новая таблица с именами файлов графика
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS schedule_files (
+               version INTEGER PRIMARY KEY,
+               name TEXT,
+               uploaded_at TEXT
+           )"""
+    )
+
     # approvers
     c.execute("SELECT COUNT(*) AS c FROM approvers")
     if c.fetchone()["c"] == 0:
@@ -427,6 +473,23 @@ def init_db() -> None:
         c.execute(
             "INSERT OR REPLACE INTO schedule_settings (key, value) "
             "VALUES ('schedule_version', '1')"
+        )
+
+    # last_notified_version (для отправки в группу один раз)
+    c.execute("SELECT value FROM schedule_settings WHERE key='last_notified_version'")
+    row_ln = c.fetchone()
+    if not row_ln:
+        c.execute(
+            "INSERT OR REPLACE INTO schedule_settings (key, value) "
+            "VALUES ('last_notified_version', '0')"
+        )
+
+    # начальное значение группы уведомлений из ENV (если задано)
+    if SCHEDULE_NOTIFY_CHAT_ID_ENV:
+        c.execute(
+            "INSERT OR IGNORE INTO schedule_settings (key, value) "
+            "VALUES ('schedule_notify_chat_id', ?)",
+            (SCHEDULE_NOTIFY_CHAT_ID_ENV,),
         )
 
     conn.commit()
@@ -461,6 +524,52 @@ def get_current_approvers(settings: dict) -> List[str]:
     return []
 
 
+def get_schedule_notify_chat_id(settings: dict) -> Optional[int]:
+    val = settings.get("schedule_notify_chat_id")
+    if not val:
+        return None
+    try:
+        return int(val)
+    except Exception:
+        return None
+
+
+def set_schedule_file_name(version: int, name: str) -> None:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO schedule_files (version, name, uploaded_at) "
+        "VALUES (?, ?, ?)",
+        (version, name, local_now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_schedule_file_names() -> Dict[int, str]:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT version, name FROM schedule_files")
+    rows = c.fetchall()
+    conn.close()
+    res: Dict[int, str] = {}
+    for r in rows:
+        try:
+            v = int(r["version"])
+        except Exception:
+            continue
+        res[v] = r["name"]
+    return res
+
+
+def get_schedule_name_for_version(version: int) -> str:
+    names = get_schedule_file_names()
+    name = names.get(version)
+    if name:
+        return name
+    return f"Версия {version}"
+
+
 # ----------------- КЛАВИАТУРЫ -----------------
 
 def main_menu() -> ReplyKeyboardMarkup:
@@ -475,11 +584,12 @@ def main_menu() -> ReplyKeyboardMarkup:
 def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
     approvers = get_current_approvers(settings)
     version = get_schedule_version(settings)
+    file_name = get_schedule_name_for_version(version)
 
     lines: List[str] = []
     lines.append("Раздел «График».")
     lines.append("")
-    lines.append(f"Текущая версия файла графика: {version}")
+    lines.append(f"Текущий файл графика: {file_name} (версия {version})")
     lines.append("")
     lines.append(
         "Порядок работы:\n"
@@ -669,7 +779,19 @@ def onzs_period_inline(onzs_num: str) -> InlineKeyboardMarkup:
     )
 
 
-# ----------------- /start, /id -----------------
+def inspector_menu_inline() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➕ Добавить выезд", callback_data="insp_add_trip"
+                )
+            ]
+        ]
+    )
+
+
+# ----------------- /start, /id, /admins, /set_schedule_group -----------------
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -694,9 +816,11 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
         return
-    await update.message.reply_text(
-        f"Ваш id: {user.id}\nusername: @{user.username or ''}"
-    )
+    chat = update.effective_chat
+    txt = f"Ваш id: {user.id}\nusername: @{user.username or ''}"
+    if chat:
+        txt += f"\nID текущего чата: {chat.id}"
+    await update.message.reply_text(txt)
 
 
 async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -706,6 +830,41 @@ async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     await update.message.reply_text(
         "Администраторы заданы жёстко в коде:\n• @asdinamitif (398960707)"
+    )
+
+
+async def cmd_set_schedule_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /set_schedule_group <chat_id>
+    Настройка группы, куда отправлять уведомление после того, как график согласован.
+    Только админ.
+    """
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("Команда доступна только администратору.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Укажи chat_id группы.\n"
+            "Подсказка: добавь бота в нужную группу и введи там /id — бот вернёт ID чата."
+        )
+        return
+
+    chat_id_str = args[0].strip()
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO schedule_settings (key, value) "
+        "VALUES ('schedule_notify_chat_id', ?)",
+        (chat_id_str,),
+    )
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"Группа для уведомлений по графику обновлена: {chat_id_str}"
     )
 
 
@@ -786,10 +945,9 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if text == "инспектор".lower():
-        context.user_data["insp_form"] = {}
-        context.user_data["insp_step"] = "date"
         await update.message.reply_text(
-            "Пошаговый мастер инспектора.\nВведите дату выезда (ДД.ММ.ГГГГ):"
+            "Раздел «Инспектор». Выберите действие:",
+            reply_markup=inspector_menu_inline(),
         )
         return
 
@@ -854,7 +1012,10 @@ async def show_remarks_not_done(query) -> None:
 
     blocks: List[tuple[str, List[str]]] = [
         ("Пожарная безопасность", [c for c in [col_pb_q, col_pb_r] if c]),
-        ("Архитектура, Доступ инвалидов, Архитектурный облик", [col_ar_y] if col_ar_y else []),
+        (
+            "Архитектура, Доступ инвалидов, Архитектурный облик",
+            [col_ar_y] if col_ar_y else [],
+        ),
         ("Электроснабжение", [col_eom_ae] if col_eom_ae else []),
     ]
     blocks = [(name, cols) for name, cols in blocks if cols]
@@ -915,6 +1076,97 @@ async def show_remarks_not_done(query) -> None:
     await query.edit_message_text("\n".join(lines))
 
 
+# ----------------- УВЕДОМЛЕНИЕ В ГРУППУ ПОСЛЕ СОГЛАСОВАНИЯ -----------------
+
+async def check_and_notify_schedule_approved(
+    context: ContextTypes.DEFAULT_TYPE, settings_after: dict
+) -> None:
+    version = get_schedule_version(settings_after)
+    approvers = get_current_approvers(settings_after)
+    if not approvers:
+        return
+
+    conn = get_db()
+    c = conn.cursor()
+    placeholders = ",".join("?" * len(approvers))
+    params: List[Any] = [version] + approvers
+    c.execute(
+        f"""SELECT approver, decision, decided_at
+            FROM approvals
+            WHERE schedule_version = ?
+              AND approver IN ({placeholders})
+            ORDER BY datetime(decided_at) DESC""",
+        params,
+    )
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        return
+
+    last_by_approver: Dict[str, sqlite3.Row] = {}
+    for r in rows:
+        appr = r["approver"]
+        if appr not in last_by_approver:
+            last_by_approver[appr] = r
+
+    # все ли согласовали (последнее решение == approve)
+    for appr in approvers:
+        r = last_by_approver.get(appr)
+        if not r or r["decision"] != "approve":
+            return
+
+    # есть ли цель для уведомления
+    notify_chat_id = get_schedule_notify_chat_id(settings_after)
+    if not notify_chat_id:
+        return
+
+    # не отправляли ли уже для этой версии
+    last_notified_raw = settings_after.get("last_notified_version") or "0"
+    try:
+        last_notified = int(last_notified_raw)
+    except Exception:
+        last_notified = 0
+    if last_notified >= version:
+        return
+
+    file_name = get_schedule_name_for_version(version)
+    lines = [
+        "✅ График выездов согласован.",
+        f"Файл: {file_name} (версия {version})",
+        "",
+        "Согласующие:",
+    ]
+    for appr in approvers:
+        r = last_by_approver.get(appr)
+        dt_raw = r["decided_at"] or ""
+        try:
+            dt_obj = datetime.fromisoformat(dt_raw)
+            dt_str = dt_obj.strftime("%d.%m.%Y %H:%М")
+        except Exception:
+            dt_str = dt_raw
+        lines.append(f"• {appr} — согласовано {dt_str}")
+
+    text = "\n".join(lines)
+
+    try:
+        await context.bot.send_message(chat_id=notify_chat_id, text=text)
+    except Exception as e:
+        log.error("Не удалось отправить уведомление в группу: %s", e)
+        return
+
+    # записываем last_notified_version
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO schedule_settings (key, value) "
+        "VALUES ('last_notified_version', ?)",
+        (str(version),),
+    )
+    conn.commit()
+    conn.close()
+
+
 # ----------------- CALLBACK -----------------
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -955,7 +1207,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         conn = get_db()
         c = conn.cursor()
         c.execute(
-            "INSERT OR REPLACE INTO schedule_settings (key, value) VALUES ('current_approver', ?)",
+            "INSERT OR REPLACE INTO schedule_settings (key, value) "
+            "VALUES ('current_approver', ?)",
             (appr,),
         )
         conn.commit()
@@ -1006,6 +1259,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         txt = build_schedule_text(is_admin_flag, new_settings)
         kb = build_schedule_inline(is_admin_flag, new_settings)
         await query.edit_message_text(txt, reply_markup=kb)
+
+        # проверяем, не все ли согласовали – если да, шлём в группу
+        await check_and_notify_schedule_approved(context, new_settings)
         return
 
     if data == "schedule_rework":
@@ -1062,6 +1318,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await show_remarks_not_done(query)
         return
 
+    # ---- Инспектор ----
+    if data == "insp_add_trip":
+        context.user_data["insp_form"] = {}
+        context.user_data["insp_step"] = "date_departure"
+        await query.edit_message_text(
+            "Пошаговый мастер инспектора.\n"
+            "Введите дату выезда (ДД.ММ.ГГГГ):"
+        )
+        return
+
     # ---- ОНзС ----
     if data.startswith("onzs_"):
         num = data.split("_", 1)[1]
@@ -1114,7 +1380,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lines = [f"ОНзС {num}:"]
         for _, r in df2.head(50).iterrows():
             try:
-                d = pd.to_datetime(r[col_date]).strftime("%d.%m.%Y")
+                d = pd.to_datetime(r[col_date]).strftime("%d.%м.%Y")
             except Exception:
                 d = str(r[col_date])
             lines.append(f"• {d} — {r.to_dict()}")
@@ -1125,7 +1391,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.edit_message_text("Команда не распознана.")
 
 
-# ----------------- СОСТОЯНИЯ: согласующий, инспектор, аналитика, ОНзС custom -----------------
+# ----------------- СОСТОЯНИЯ: согласующий, инспектор, аналитика, ОНзС custom, имя графика -----------------
 
 async def handle_custom_approver_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.user_data.get("await_custom_approver"):
@@ -1244,15 +1510,35 @@ async def handle_inspector_step(update: Update, context: ContextTypes.DEFAULT_TY
     form = context.user_data.get("insp_form", {})
     text = (update.message.text or "").strip()
 
-    if step == "date":
+    if step == "date_departure":
         try:
             d = datetime.strptime(text, "%d.%m.%Y").date()
         except Exception:
             await update.message.reply_text(
-                "Не понял дату. Введите в формате ДД.ММ.ГГГГ, например 03.12.2025."
+                "Не понял дату выезда. Введите в формате ДД.ММ.ГГГГ, например 03.12.2025."
             )
             return
-        form["date"] = d
+        form["date_departure"] = d
+        context.user_data["insp_form"] = form
+        context.user_data["insp_step"] = "date_final"
+        await update.message.reply_text(
+            "Дата начала итоговой проверки (ДД.ММ.ГГГГ) "
+            "или напишите «нет», если пока нет:"
+        )
+        return
+
+    if step == "date_final":
+        if text.lower() in ("нет", "-", "—", "0", "n/a", "na"):
+            form["date_final"] = ""
+        else:
+            try:
+                d = datetime.strptime(text, "%d.%m.%Y").date()
+            except Exception:
+                await update.message.reply_text(
+                    "Не понял дату. Введите в формате ДД.ММ.ГГГГ или «нет»."
+                )
+                return
+            form["date_final"] = d
         context.user_data["insp_form"] = form
         context.user_data["insp_step"] = "area"
         await update.message.reply_text("Площадь (кв.м):")
@@ -1339,6 +1625,8 @@ async def handle_analytics_password(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("Неверный пароль.")
         return
 
+    file_names = get_schedule_file_names()
+
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT decision, COUNT(*) AS c FROM approvals GROUP BY decision")
@@ -1387,6 +1675,15 @@ async def handle_analytics_password(update: Update, context: ContextTypes.DEFAUL
     if hist:
         for r in hist:
             ver = r["schedule_version"] or "-"
+            try:
+                ver_int = int(ver)
+            except Exception:
+                ver_int = 0
+            name = file_names.get(ver_int)
+            if name:
+                file_label = f"{name} (версия {ver_int})"
+            else:
+                file_label = f"Версия {ver}"
             appr_label = r["approver"] or "—"
             decision = r["decision"]
             if decision == "approve":
@@ -1402,11 +1699,37 @@ async def handle_analytics_password(update: Update, context: ContextTypes.DEFAUL
             except Exception:
                 dt_str = dt_raw
             comment = f" (комментарий: {r['comment']})" if r["comment"] else ""
-            lines.append(f" • Версия {ver}: {appr_label} — {dec_text} {dt_str}{comment}")
+            lines.append(f" • {file_label}: {appr_label} — {dec_text} {dt_str}{comment}")
     else:
         lines.append(" • пока нет решений по графику")
 
     await update.message.reply_text("\n".join(lines))
+
+
+async def handle_schedule_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ver = context.user_data.get("await_schedule_name")
+    if not ver:
+        return
+
+    name = (update.message.text or "").strip()
+    context.user_data["await_schedule_name"] = None
+
+    if not name:
+        await update.message.reply_text(
+            "Пустое название. Имя файла не сохранено.", reply_markup=main_menu()
+        )
+        return
+
+    try:
+        ver_int = int(ver)
+    except Exception:
+        ver_int = 0
+
+    set_schedule_file_name(ver_int, name)
+    await update.message.reply_text(
+        f"Название графика сохранено: {name} (версия {ver_int}).",
+        reply_markup=main_menu(),
+    )
 
 
 # ----------------- ДОКУМЕНТЫ -----------------
@@ -1436,6 +1759,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         SCHEDULE_CACHE["mtime"] = None
         SCHEDULE_CACHE["df"] = None
 
+        # увеличиваем версию
         settings = get_schedule_state()
         ver = get_schedule_version(settings) + 1
 
@@ -1448,8 +1772,12 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         conn.commit()
         conn.close()
 
+        # просим ввести имя файла графика
+        context.user_data["await_schedule_name"] = ver
         await msg.reply_text(
-            f"Файл графика сохранён (версия {ver}).", reply_markup=main_menu()
+            f"Файл графика сохранён (версия {ver}).\n"
+            "Введите название для этого графика, например:\n"
+            "«График выездов за декабрь 2025»."
         )
         return
 
@@ -1475,6 +1803,10 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.user_data.get("await_analytics_pass"):
         await handle_analytics_password(update, context)
+        return
+
+    if context.user_data.get("await_schedule_name"):
+        await handle_schedule_name_input(update, context)
         return
 
     if context.user_data.get("insp_step"):
@@ -1508,6 +1840,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("id", id_cmd))
     app.add_handler(CommandHandler("admins", cmd_admins))
+    app.add_handler(CommandHandler("set_schedule_group", cmd_set_schedule_group))
 
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
