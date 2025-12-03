@@ -45,7 +45,7 @@ SCHEDULE_URL = os.getenv("SCHEDULE_URL", "").strip()
 REMARKS_URL = os.getenv("REMARKS_URL", "").strip()
 
 SCHEDULE_PATH = os.getenv("SCHEDULE_PATH", "schedule.xlsx")
-# >>> по умолчанию работаем с remarks2.xlsx <<<
+# по умолчанию работаем с remarks2.xlsx
 REMARKS_PATH = os.getenv("REMARKS_PATH", "remarks2.xlsx")
 
 SCHEDULE_SYNC_TTL_SEC = int(os.getenv("SCHEDULE_SYNC_TTL_SEC", "3600"))
@@ -317,72 +317,92 @@ def get_col_by_letter(df: pd.DataFrame, letters: str) -> Optional[str]:
 
 async def show_remarks_by_status(query, status_key: str) -> None:
     """
-    Показывает строки из Excel по статусу:
-    status_key = "done"         → в Q, R, Y, AD стоит 'да'
-    status_key = "not_done"     → в Q, R, Y, AD стоит 'нет'
-    status_key = "not_required" → во всех Q, R, Y, AD пусто
+    Показывает список по статусу:
+      done         → да
+      not_done     → нет
+      not_required → пусто
+
+    В формате:
+      • 06-35-101800 — ПБ
+      • 06-35-101800 — ПБ в ЗК КНД
+      • 06-35-101800 — АР/ММГН/АГО
+      • 06-35-101800 — ЭОМ
     """
     df = get_remarks_df()
     if df is None:
         await query.edit_message_text("Файл замечаний не найден.")
         return
 
-    # Столбцы по буквам (как в ТЗ)
-    col_pb = get_col_by_letter(df, "Q")    # Пожарная безопасность: да/нет
-    col_pbzk = get_col_by_letter(df, "R")  # ПБ в ЗК КНД: да/нет
-    col_ar = get_col_by_letter(df, "Y")    # АР/ММГН/АГО: да/нет
-    col_eom = get_col_by_letter(df, "AD")  # ЭОМ: да/нет
+    # Столбец с номером дела
+    col_case = find_col(df, ["номер дела", "дело"])
+    if col_case is None:
+        col_case = get_col_by_letter(df, "I")  # запасной вариант
 
-    cols = [c for c in [col_pb, col_pbzk, col_ar, col_eom] if c and c in df.columns]
+    # Столбцы отметок по буквам
+    col_pb = get_col_by_letter(df, "Q")    # ПБ
+    col_pbzk = get_col_by_letter(df, "R")  # ПБ в ЗК КНД
+    col_ar = get_col_by_letter(df, "Y")    # АР/ММГН/АГО
+    col_eom = get_col_by_letter(df, "AD")  # ЭОМ
 
-    if not cols:
+    mapping = [
+        ("ПБ", col_pb),
+        ("ПБ в ЗК КНД", col_pbzk),
+        ("АР/ММГН/АГО", col_ar),
+        ("ЭОМ", col_eom),
+    ]
+    mapping = [(name, col) for name, col in mapping if col and col in df.columns]
+
+    if not mapping or not col_case:
         await query.edit_message_text(
-            "Не удалось найти столбцы отметок об устранении (Q, R, Y, AD) в файле."
+            "Не удалось найти столбцы «Номер дела» или отметок (Q, R, Y, AD) в файле."
         )
         return
 
-    df2 = df.copy()
-
-    # Маска по статусу
+    # Какое значение ищем
     if status_key == "done":
-        # хотя бы в одном из столбцов стоит "да"
-        mask = None
-        for c in cols:
-            col_mask = df2[c].astype(str).str.strip().str.lower().eq("да")
-            mask = col_mask if mask is None else (mask | col_mask)
+        target = "да"
         human = "УСТРАНЕНЫ (да)"
     elif status_key == "not_done":
-        # хотя бы в одном из столбцов стоит "нет"
-        mask = None
-        for c in cols:
-            col_mask = df2[c].astype(str).str.strip().str.lower().eq("нет")
-            mask = col_mask if mask is None else (mask | col_mask)
+        target = "нет"
         human = "НЕ УСТРАНЕНЫ (нет)"
     elif status_key == "not_required":
-        # во всех этих столбцах пусто
-        mask = None
-        for c in cols:
-            col_mask = df2[c].astype(str).fillna("").str.strip().eq("")
-            mask = col_mask if mask is None else (mask & col_mask)
+        target = ""   # пустая ячейка
         human = "НЕ ТРЕБУЕТСЯ (пусто)"
     else:
         await query.edit_message_text("Неизвестный статус.")
         return
 
-    df_filtered = df2[mask] if mask is not None else df2.iloc[0:0]
+    lines: List[str] = [f"Строки со статусом «{human}» (максимум 50 строк):", ""]
+    count = 0
 
-    if df_filtered.empty:
-        await query.edit_message_text(f"Нет строк со статусом «{human}».")
+    for _, row in df.iterrows():
+        case_no = str(row.get(col_case, "")).strip()
+        if not case_no:
+            continue
+
+        for block_name, col in mapping:
+            cell = str(row.get(col, "") or "").strip().lower()
+
+            if target in ("да", "нет"):
+                if cell == target:
+                    lines.append(f"• {case_no} — {block_name}")
+                    count += 1
+            else:  # not_required: пусто
+                if cell == "":
+                    lines.append(f"• {case_no} — {block_name}")
+                    count += 1
+
+            if count >= 50:
+                break
+        if count >= 50:
+            break
+
+    if count == 0:
+        await query.edit_message_text(f"Нет дел со статусом «{human}».")
         return
 
-    lines = [f"Строки со статусом «{human}» (показаны первые 20):", ""]
-    for idx, row in df_filtered.head(20).iterrows():
-        row_dict = row.to_dict()
-        lines.append(f"— строка {idx + 1}: {row_dict}")
-
-    if len(df_filtered) > 20:
-        lines.append("")
-        lines.append(f"… и ещё {len(df_filtered) - 20} строк с этим статусом.")
+    lines.append("")
+    lines.append(f"Всего найдено записей: {count} (показаны первые 50).")
 
     await query.edit_message_text("\n".join(lines))
 
@@ -690,7 +710,7 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
         dt_raw = r["decided_at"] or ""
         try:
             dt_obj = datetime.fromisoformat(dt_raw)
-            dt_str = dt_obj.strftime("%d.%m.%Y %H:%М")
+            dt_str = dt_obj.strftime("%d.%m.%Y %H:%M")
         except Exception:
             dt_str = dt_raw
 
@@ -932,9 +952,18 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if text == "📝 замечания".lower():
         df = get_remarks_df()
         if df is None:
-            await update.message.reply_text(
-                "Рабочий файл замечаний ещё не загружен или повреждён."
-            )
+            # если файл не читается, админу сразу предлагаем его загрузить
+            if is_admin(update.effective_user.id):
+                context.user_data["await_remarks_file"] = True
+                await update.message.reply_text(
+                    "Рабочий файл замечаний ещё не загружен или повреждён.\n"
+                    "Отправьте сюда Excel-файл замечаний (.xlsx) — бот сохранит его как рабочий."
+                )
+            else:
+                await update.message.reply_text(
+                    "Рабочий файл замечаний ещё не загружен или повреждён. "
+                    "Обратитесь к администратору, чтобы он загрузил файл."
+                )
             return
 
         await update.message.reply_text(
@@ -1118,7 +1147,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if data.startswith("remarks_"):
         status = data.replace("remarks_", "")
-        # вместо запроса номера строки показываем все строки с нужным статусом
         await show_remarks_by_status(query, status)
         return
 
@@ -1178,7 +1206,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         for _, r in df2.head(50).iterrows():
             d = ""
             try:
-                d = pd.to_datetime(r[col_date]).strftime("%d.%м.%Y")
+                d = pd.to_datetime(r[col_date]).strftime("%d.%m.%Y")
             except Exception:
                 d = str(r[col_date])
             lines.append(f"• {d} — {r.to_dict()}")
@@ -1230,7 +1258,7 @@ async def handle_custom_approver_input(update: Update, context: ContextTypes.DEF
 
 
 async def handle_remarks_row_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # этот обработчик сейчас не используется, но оставлен на будущее
+    # сейчас не используется; оставлен на будущее
     if not context.user_data.get("await_remarks_row"):
         return
 
@@ -1252,7 +1280,6 @@ async def handle_remarks_row_input(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("Не удалось определить статус. Начните заново из раздела «Замечания».")
         return
 
-    # Маппинг на да/нет для аналитики
     if status_key == "done":
         pb = "да"
         pbzk = "да"
@@ -1363,7 +1390,7 @@ async def handle_inspector_step(update: Update, context: ContextTypes.DEFAULT_TY
 
     if step == "date":
         try:
-            d = datetime.strptime(text, "%d.%м.%Y").date()
+            d = datetime.strptime(text, "%d.%m.%Y").date()
         except Exception:
             await update.message.reply_text(
                 "Не понял дату. Введите в формате ДД.ММ.ГГГГ, например 03.12.2025."
