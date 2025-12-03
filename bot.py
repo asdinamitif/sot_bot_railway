@@ -312,6 +312,80 @@ def get_col_by_letter(df: pd.DataFrame, letters: str) -> Optional[str]:
     return None
 
 
+# ----------------- ОТБОР СТРОК ПО СТАТУСУ "УСТРАНЕНЫ / НЕ УСТРАНЕНЫ / НЕ ТРЕБУЕТСЯ" -----------------
+
+async def show_remarks_by_status(query, status_key: str) -> None:
+    """
+    Показывает строки из Excel по статусу:
+    status_key = "done"         → в Q, R, Y, AD стоит 'да'
+    status_key = "not_done"     → в Q, R, Y, AD стоит 'нет'
+    status_key = "not_required" → во всех Q, R, Y, AD пусто
+    """
+    df = get_remarks_df()
+    if df is None:
+        await query.edit_message_text("Файл замечаний не найден.")
+        return
+
+    # Столбцы по буквам (как в ТЗ)
+    col_pb = get_col_by_letter(df, "Q")    # Пожарная безопасность: да/нет
+    col_pbzk = get_col_by_letter(df, "R")  # ПБ в ЗК КНД: да/нет
+    col_ar = get_col_by_letter(df, "Y")    # АР/ММГН/АГО: да/нет
+    col_eom = get_col_by_letter(df, "AD")  # ЭОМ: да/нет
+
+    cols = [c for c in [col_pb, col_pbzk, col_ar, col_eom] if c and c in df.columns]
+
+    if not cols:
+        await query.edit_message_text(
+            "Не удалось найти столбцы отметок об устранении (Q, R, Y, AD) в файле."
+        )
+        return
+
+    df2 = df.copy()
+
+    # Маска по статусу
+    if status_key == "done":
+        # хотя бы в одном из столбцов стоит "да"
+        mask = None
+        for c in cols:
+            col_mask = df2[c].astype(str).str.strip().str.lower().eq("да")
+            mask = col_mask if mask is None else (mask | col_mask)
+        human = "УСТРАНЕНЫ (да)"
+    elif status_key == "not_done":
+        # хотя бы в одном из столбцов стоит "нет"
+        mask = None
+        for c in cols:
+            col_mask = df2[c].astype(str).str.strip().str.lower().eq("нет")
+            mask = col_mask if mask is None else (mask | col_mask)
+        human = "НЕ УСТРАНЕНЫ (нет)"
+    elif status_key == "not_required":
+        # во всех этих столбцах пусто
+        mask = None
+        for c in cols:
+            col_mask = df2[c].astype(str).fillna("").str.strip().eq("")
+            mask = col_mask if mask is None else (mask & col_mask)
+        human = "НЕ ТРЕБУЕТСЯ (пусто)"
+    else:
+        await query.edit_message_text("Неизвестный статус.")
+        return
+
+    df_filtered = df2[mask] if mask is not None else df2.iloc[0:0]
+
+    if df_filtered.empty:
+        await query.edit_message_text(f"Нет строк со статусом «{human}».")
+        return
+
+    lines = [f"Строки со статусом «{human}» (показаны первые 20):", ""]
+    for idx, row in df_filtered.head(20).iterrows():
+        row_dict = row.to_dict()
+        lines.append(f"— строка {idx + 1}: {row_dict}")
+
+    if len(df_filtered) > 20:
+        lines.append("")
+        lines.append(f"… и ещё {len(df_filtered) - 20} строк с этим статусом.")
+
+    await query.edit_message_text("\n".join(lines))
+
+
 # ----------------- ЗАПИСЬ В ИНСПЕКТОРСКИЙ ЛИСТ -----------------
 
 def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
@@ -1043,11 +1117,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if data.startswith("remarks_"):
         status = data.replace("remarks_", "")
-        context.user_data["remarks_status"] = status
-        await query.edit_message_text(
-            f"Введите номер строки в Excel для установки статуса '{status}':"
-        )
-        context.user_data["await_remarks_row"] = True
+        # вместо запроса номера строки показываем все строки с нужным статусом
+        await show_remarks_by_status(query, status)
         return
 
     # ----------------- ОНЗС -----------------
@@ -1158,6 +1229,7 @@ async def handle_custom_approver_input(update: Update, context: ContextTypes.DEF
 
 
 async def handle_remarks_row_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # этот обработчик сейчас не используется, но оставлен на будущее
     if not context.user_data.get("await_remarks_row"):
         return
 
