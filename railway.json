@@ -1,6 +1,1 @@
-{
-  "deploy": {
-    "startCommand": "sh -c \"echo \\\"$sot_bot_railway\\\" > credentials.json && python3 bot.py\"",
-    "restartPolicyType": "ALWAYS"
-  }
-}
+python3 bot.py → python3 samastroi_telethon.py
