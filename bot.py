@@ -615,7 +615,7 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
         dt_raw = r["decided_at"] or ""
         try:
             dt_obj = datetime.fromisoformat(dt_raw)
-            dt_str = dt_obj.strftime("%d.%m.%Y %H:%М")
+            dt_str = dt_obj.strftime("%d.%m.%Y %H:%M")
         except Exception:
             dt_str = dt_raw
 
@@ -1231,8 +1231,8 @@ async def handle_onzs_custom_input(update: Update, context: ContextTypes.DEFAULT
         # поддержка разных тире
         t = text.replace("—", "-").replace("–", "-")
         s1, s2 = [p.strip() for p in t.split("-", 1)]
-        d1 = datetime.strptime(s1, "%d.%м.%Y").date()
-        d2 = datetime.strptime(s2, "%d.%м.%Y").date()
+        d1 = datetime.strptime(s1, "%d.%m.%Y").date()
+        d2 = datetime.strptime(s2, "%d.%m.%Y").date()
         if d2 < d1:
             d1, d2 = d2, d1
     except Exception:
@@ -1265,7 +1265,7 @@ async def handle_onzs_custom_input(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("Нет данных для заданного периода.")
         return
 
-    lines = [f"ОНзС {num} за период {d1.strftime('%d.%м.%Y')}–{d2.strftime('%d.%м.%Y')}:"]
+    lines = [f"ОНзС {num} за период {d1.strftime('%d.%m.%Y')}–{d2.strftime('%d.%m.%Y')}:"]
 
     for _, r in df2.head(50).iterrows():
         dstr = ""
@@ -1290,7 +1290,7 @@ async def handle_inspector_step(update: Update, context: ContextTypes.DEFAULT_TY
 
     if step == "date":
         try:
-            d = datetime.strptime(text, "%d.%м.%Y").date()
+            d = datetime.strptime(text, "%d.%m.%Y").date()
         except Exception:
             await update.message.reply_text(
                 "Не понял дату. Введите в формате ДД.ММ.ГГГГ, например 03.12.2025."
