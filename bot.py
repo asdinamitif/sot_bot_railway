@@ -44,7 +44,14 @@ log = logging.getLogger("sot_bot")
 #               CONFIG
 # --------------------------------------------
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# Читаем токен из нескольких возможных переменных окружения,
+# чтобы было удобнее на Railway.
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN", "").strip()
+    or os.getenv("TG_BOT_TOKEN", "").strip()
+    or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+)
+
 ANALYTICS_PASSWORD = "051995"
 
 # Spreadsheet ID (нужно заменить на ваш реальный ID)
@@ -185,6 +192,8 @@ def upload_to_drive(local_path: str, drive_folder_id: str) -> str:
 
     # Возвращаем ссылку
     return f"https://drive.google.com/uc?id={file['id']}&export=download"
+
+
 # ============================================
 #   PART 2 — SQLITE, ИСТОРИЯ, УТИЛИТЫ
 # ============================================
@@ -396,6 +405,8 @@ def save_file_record(row_number: int, file_url: str, file_name: str, user):
     ))
     conn.commit()
     conn.close()
+
+
 # ============================================
 #       PART 3 — MAIN MENU & ROUTER
 # ============================================
@@ -455,49 +466,6 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# --------------------------------------------
-#         РАСПОЗНАВАНИЕ ТЕКСТА
-# --------------------------------------------
-
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Роутер текстовых сообщений (FSM блоки в других частях)"""
-    text = (update.message.text or "").strip().lower()
-
-    # Если активна FSM «Инспектор»
-    if context.user_data.get("inspector_state"):
-        await inspector_fsm(update, context)
-        return
-
-    # --------------------------------------------------
-    # Простой роутинг по меню
-    # --------------------------------------------------
-
-    if text == "📅 график".lower():
-        await handle_schedule(update, context)
-        return
-
-    if text == "📊 итоговая".lower():
-        await handle_final(update, context)
-        return
-
-    if text == "📝 замечания".lower():
-        await handle_remarks_menu(update, context)
-        return
-
-    if text == "🏗 онзс".lower():
-        await handle_onzs_menu(update, context)
-        return
-
-    if text == "👷 инспектор".lower():
-        await handle_inspector_start(update, context)
-        return
-
-    if text == "📈 аналитика".lower():
-        await handle_analytics(update, context)
-        return
-
-    # Если текст не относится к меню — игнорируем
-    await update.message.reply_text("Выберите действие из меню.", reply_markup=main_menu())
 # ============================================
 #     PART 4 — 📅 ГРАФИК и 📊 ИТОГОВАЯ
 # ============================================
@@ -668,6 +636,8 @@ async def handle_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(line)
 
     await update.message.reply_text("\n".join(lines), reply_markup=main_menu())
+
+
 # ============================================
 #     PART 5 — 📝 ЗАМЕЧАНИЯ (СТАТУСЫ)
 # ============================================
@@ -858,6 +828,8 @@ async def remarks_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("По текущему файлу таких строк нет.")
 
     await query.edit_message_text("\n".join(lines))
+
+
 # ============================================
 #   PART 6 — 🏗 ОНзС + СТАТУСЫ + ФАЙЛЫ (DRIVE)
 # ============================================
@@ -980,7 +952,7 @@ async def onzs_custom_period_text(update: Update, context: ContextTypes.DEFAULT_
 
     await update.message.reply_text(
         f"Показываю объекты по ОНзС {onzs_str} за период "
-        f"{d1.strftime('%d.%m.%Y')}–{d2.strftime('%d.%m.%Y')}..."
+        f"{d1.strftime('%d.%m.%Y')}–{d2.strftime('%d.%м.%Y')}..."
     )
 
     await send_onzs_list(
@@ -1294,7 +1266,7 @@ async def generic_attachment_handler(update: Update, context: ContextTypes.DEFAU
 
     attach_ctx = context.user_data.get("await_onzs_attachment")
     if not attach_ctx:
-        # нет привязки к ОНзС — можно расширить логику при необходимости
+        # нет привязки к ОНЗС — можно расширить логику при необходимости
         return
 
     onzs_str = attach_ctx["onzs"]
@@ -1337,6 +1309,8 @@ async def generic_attachment_handler(update: Update, context: ContextTypes.DEFAU
 
     # Сбрасываем контекст
     context.user_data["await_onzs_attachment"] = None
+
+
 # ============================================
 #      PART 7 — 👷 ИНСПЕКТОР (МАСТЕР)
 # ============================================
@@ -1491,7 +1465,6 @@ async def inspector_fsm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data = load_sheet_data(SHEET_INSPECTOR)
             if not data:
                 # Если лист пустой — создадим заголовок + первый ряд
-                # Но обычно у вас уже есть заголовок, поэтому этот кейс — запасной
                 header = [
                     "№ п/п",                # A
                     "Дата выезда",          # B
@@ -1512,9 +1485,6 @@ async def inspector_fsm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ).execute()
                 data = [header]
 
-            # data[0] — заголовок, далее строки
-            # Номер следующего объекта:
-            # количество фактических строк (без заголовка) = len(data) - 1
             current_count = max(len(data) - 1, 0)
             new_index = current_count + 1   # это пойдёт в колонку A (№ п/п)
 
@@ -1580,13 +1550,11 @@ async def inspector_fsm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Произошла ошибка в мастере «Инспектор». Попробуйте начать заново.",
         reply_markup=main_menu()
     )
-# ============================================
-#      PART 8 — 📈 АНАЛИТИКА И MAIN()
-# ============================================
 
-# --------------------------------------------
-#              📈 АНАЛИТИКА
-# --------------------------------------------
+
+# ============================================
+#      PART 8 — 📈 АНАЛИТИКА И ROUTER
+# ============================================
 
 def build_analytics_text() -> str:
     """
@@ -1711,7 +1679,7 @@ async def analytics_password_text(update: Update, context: ContextTypes.DEFAULT_
 
 
 # --------------------------------------------
-#  ОБНОВЛЁННЫЙ РОУТЕР ТЕКСТА (ЗАМЕНЯЕТ СТАРЫЙ)
+#  ФИНАЛЬНЫЙ РОУТЕР ТЕКСТА
 # --------------------------------------------
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1778,7 +1746,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("Укажи BOT_TOKEN в переменных окружения или .env")
+        log.error(
+            "Не задан токен бота. Укажи BOT_TOKEN (или TG_BOT_TOKEN / TELEGRAM_BOT_TOKEN) "
+            "в переменных окружения Railway (токен от @BotFather)."
+        )
+        raise SystemExit(1)
 
     # Инициализация БД
     init_db()
