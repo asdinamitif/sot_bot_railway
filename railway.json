@@ -1,1 +1,1 @@
-python3 bot.py → python3 samastroi_telethon.py
+sh -c "echo \"$sot_bot_railway\" > credentials.json && python3 bot.py"
