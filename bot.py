@@ -40,12 +40,12 @@ load_dotenv()
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "8274616381:AAE4Av9RgX8iSRfM1n2U9V8oPoWAf-bB_hA").strip()
 DB_PATH = os.getenv("DB_PATH", "sot_bot.db")
 
-# Один Excel для всего
+# Один Excel для графика
 SCHEDULE_URL = os.getenv("SCHEDULE_URL", "").strip()
-REMARKS_URL = os.getenv("REMARKS_URL", "").strip()
-
 SCHEDULE_PATH = os.getenv("SCHEDULE_PATH", "schedule.xlsx")
-# по умолчанию работаем с remarks2.xlsx
+
+# Excel с замечаниями – работаем с remarks2.xlsx
+REMARKS_URL = os.getenv("REMARKS_URL", "").strip()  # по сути не используется
 REMARKS_PATH = os.getenv("REMARKS_PATH", "remarks2.xlsx")
 
 SCHEDULE_SYNC_TTL_SEC = int(os.getenv("SCHEDULE_SYNC_TTL_SEC", "3600"))
@@ -83,6 +83,15 @@ REMARKS_CACHE = {"mtime": None, "df": None}
 
 def local_now() -> datetime:
     return datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
+
+
+def get_current_remarks_sheet_name() -> str:
+    """
+    Имя листа с замечаниями на текущий год.
+    Например: «ПБ, АР,ММГН, АГО (2025)» – в следующем году станет (2026).
+    """
+    year = local_now().year
+    return f"ПБ, АР,ММГН, АГО ({year})"
 
 
 # ----------------- ЗАГРУЗКА ФАЙЛОВ (ЯНДЕКС / GOOGLE / ПРЯМОЙ URL) -----------------
@@ -148,6 +157,7 @@ def download_file_if_needed(url: str, local_path: str, ttl_seconds: int) -> None
       – если файла нет → скачиваем
       – если устарел → скачиваем
       – иначе ничего не делаем
+    Используется сейчас только для графика.
     """
     if not url:
         log.warning(f"URL не задан для {local_path}.")
@@ -280,7 +290,8 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
 
 
 def get_remarks_df() -> Optional[pd.DataFrame]:
-    download_file_if_needed(REMARKS_URL, REMARKS_PATH, REMARKS_SYNC_TTL_SEC)
+    # Файл замечаний теперь только локальный (remarks2.xlsx)
+    # Если надо – можешь руками обновлять через загрузку в боте
     return load_excel_all_sheets(REMARKS_PATH, REMARKS_CACHE)
 
 
@@ -311,100 +322,6 @@ def get_col_by_letter(df: pd.DataFrame, letters: str) -> Optional[str]:
     if 0 <= idx < len(df.columns):
         return df.columns[idx]
     return None
-
-
-# ----------------- ОТБОР СТРОК ПО СТАТУСУ "УСТРАНЕНЫ / НЕ УСТРАНЕНЫ / НЕ ТРЕБУЕТСЯ" -----------------
-
-async def show_remarks_by_status(query, status_key: str) -> None:
-    """
-    Показывает список по статусу:
-      done         → да
-      not_done     → нет
-      not_required → пусто
-
-    В формате:
-      • 06-35-101800 — ПБ
-      • 06-35-101800 — ПБ в ЗК КНД
-      • 06-35-101800 — АР/ММГН/АГО
-      • 06-35-101800 — ЭОМ
-    """
-    df = get_remarks_df()
-    if df is None:
-        await query.edit_message_text("Файл замечаний не найден.")
-        return
-
-    # Столбец с номером дела
-    col_case = find_col(df, ["номер дела", "дело"])
-    if col_case is None:
-        col_case = get_col_by_letter(df, "I")  # запасной вариант
-
-    # Столбцы отметок по буквам
-    col_pb = get_col_by_letter(df, "Q")    # ПБ
-    col_pbzk = get_col_by_letter(df, "R")  # ПБ в ЗК КНД
-    col_ar = get_col_by_letter(df, "Y")    # АР/ММГН/АГО
-    col_eom = get_col_by_letter(df, "AD")  # ЭОМ
-
-    mapping = [
-        ("ПБ", col_pb),
-        ("ПБ в ЗК КНД", col_pbzk),
-        ("АР/ММГН/АГО", col_ar),
-        ("ЭОМ", col_eom),
-    ]
-    mapping = [(name, col) for name, col in mapping if col and col in df.columns]
-
-    if not mapping or not col_case:
-        await query.edit_message_text(
-            "Не удалось найти столбцы «Номер дела» или отметок (Q, R, Y, AD) в файле."
-        )
-        return
-
-    # Какое значение ищем
-    if status_key == "done":
-        target = "да"
-        human = "УСТРАНЕНЫ (да)"
-    elif status_key == "not_done":
-        target = "нет"
-        human = "НЕ УСТРАНЕНЫ (нет)"
-    elif status_key == "not_required":
-        target = ""   # пустая ячейка
-        human = "НЕ ТРЕБУЕТСЯ (пусто)"
-    else:
-        await query.edit_message_text("Неизвестный статус.")
-        return
-
-    lines: List[str] = [f"Строки со статусом «{human}» (максимум 50 строк):", ""]
-    count = 0
-
-    for _, row in df.iterrows():
-        case_no = str(row.get(col_case, "")).strip()
-        if not case_no:
-            continue
-
-        for block_name, col in mapping:
-            cell = str(row.get(col, "") or "").strip().lower()
-
-            if target in ("да", "нет"):
-                if cell == target:
-                    lines.append(f"• {case_no} — {block_name}")
-                    count += 1
-            else:  # not_required: пусто
-                if cell == "":
-                    lines.append(f"• {case_no} — {block_name}")
-                    count += 1
-
-            if count >= 50:
-                break
-        if count >= 50:
-            break
-
-    if count == 0:
-        await query.edit_message_text(f"Нет дел со статусом «{human}».")
-        return
-
-    lines.append("")
-    lines.append(f"Всего найдено записей: {count} (показаны первые 50).")
-
-    await query.edit_message_text("\n".join(lines))
 
 
 # ----------------- ЗАПИСЬ В ИНСПЕКТОРСКИЙ ЛИСТ -----------------
@@ -803,12 +720,8 @@ def remarks_menu_inline() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ Устранены", callback_data="remarks_done"),
-                InlineKeyboardButton("❌ Не устранены", callback_data="remarks_not_done"),
-            ],
-            [
                 InlineKeyboardButton(
-                    "➖ Не требуется", callback_data="remarks_not_required"
+                    "❌ Не устранены", callback_data="remarks_not_done"
                 ),
             ],
             [
@@ -995,6 +908,129 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("Не понял команду. Выберите раздел на клавиатуре.")
 
 
+# ----------------- ЗАМЕЧАНИЯ: НЕ УСТРАНЕНЫ -----------------
+
+async def show_remarks_not_done(query) -> None:
+    """
+    Показывает список дел, где есть НЕ УСТРАНЁННЫЕ нарушения (значение «нет»)
+    хотя бы в одном из блоков:
+      • Пожарная безопасность     → столбцы Q и R
+      • Архитектура…             → столбец Y
+      • Электроснабжение         → столбец AE
+
+    Работает только с листом «ПБ, АР,ММГН, АГО (текущий год)».
+    Формат строки:
+      • Номер дела — Блок1; Блок2; ...
+    """
+    df_all = get_remarks_df()
+    if df_all is None:
+        await query.edit_message_text("Файл замечаний не найден.")
+        return
+
+    sheet_name = get_current_remarks_sheet_name()
+
+    # берём только нужный лист
+    if "_sheet" in df_all.columns:
+        df = df_all[df_all["_sheet"].astype(str) == sheet_name].copy()
+    else:
+        df = df_all.copy()
+
+    if df.empty:
+        sheets = (
+            df_all["_sheet"].unique().tolist()
+            if "_sheet" in df_all.columns
+            else []
+        )
+        text = (
+            f"На листе «{sheet_name}» нет данных.\n"
+            f"Доступные листы: {', '.join(map(str, sheets)) or 'не удалось определить'}."
+        )
+        await query.edit_message_text(text)
+        return
+
+    # Номер дела
+    col_case = find_col(df, ["номер дела", "дело"])
+    if col_case is None:
+        col_case = get_col_by_letter(df, "I")  # запасной вариант
+
+    if col_case is None:
+        await query.edit_message_text("Не удалось найти столбец «Номер дела» в файле.")
+        return
+
+    # Столбцы с отметками
+    col_pb_q = get_col_by_letter(df, "Q")
+    col_pb_r = get_col_by_letter(df, "R")
+    col_ar_y = get_col_by_letter(df, "Y")
+    col_eom_ae = get_col_by_letter(df, "AE")  # ВАЖНО: AE, как ты написал
+
+    blocks: List[tuple[str, List[str]]] = [
+        ("Пожарная безопасность", [col for col in [col_pb_q, col_pb_r] if col]),
+        ("Архитектура, Доступ инвалидов, Архитектурный облик", [col_ar_y] if col_ar_y else []),
+        ("Электроснабжение", [col_eom_ae] if col_eom_ae else []),
+    ]
+    # убираем блоки без столбцов
+    blocks = [(name, cols) for name, cols in blocks if cols]
+
+    if not blocks:
+        await query.edit_message_text(
+            "Не удалось найти столбцы Q, R, Y, AE на листе с замечаниями."
+        )
+        return
+
+    # накапливаем: номер дела → множество блоков, где есть «нет»
+    case_blocks: dict[str, set[str]] = {}
+    order: List[str] = []
+
+    for _, row in df.iterrows():
+        case_no = str(row.get(col_case, "")).strip()
+        if not case_no:
+            continue
+
+        row_blocks: List[str] = []
+        for block_name, cols in blocks:
+            values = [
+                str(row.get(col, "") or "").strip().lower()
+                for col in cols
+            ]
+            if any(v == "нет" for v in values):
+                row_blocks.append(block_name)
+
+        if not row_blocks:
+            continue
+
+        if case_no not in case_blocks:
+            case_blocks[case_no] = set()
+            order.append(case_no)
+
+        case_blocks[case_no].update(row_blocks)
+
+    if not case_blocks:
+        await query.edit_message_text(
+            f"На листе «{sheet_name}» нет дел с неустранёнными нарушениями (значение «нет»)."
+        )
+        return
+
+    lines: List[str] = [
+        "Строки со статусом «НЕ УСТРАНЕНЫ (нет)»",
+        f"Лист: «{sheet_name}»",
+        "",
+    ]
+
+    # формируем не больше 50 строк
+    for case_no in order[:50]:
+        blocks_list = sorted(case_blocks[case_no])
+        line_blocks = "; ".join(blocks_list)
+        lines.append(f"• {case_no} — {line_blocks}")
+
+    if len(order) > 50:
+        lines.append("")
+        lines.append(
+            f"Всего дел: {len(order)}, показаны первые 50."
+        )
+
+    await query.edit_message_text("\n".join(lines))
+
+
 # ----------------- CALLBACK-КНОПКИ -----------------
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1145,9 +1181,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
         return
 
-    if data.startswith("remarks_"):
-        status = data.replace("remarks_", "")
-        await show_remarks_by_status(query, status)
+    if data == "remarks_not_done":
+        await show_remarks_not_done(query)
         return
 
     # ----------------- ОНЗС -----------------
