@@ -1,21 +1,22 @@
 FROM python:3.11-slim
 
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
 WORKDIR /app
 
-# Установка зависимостей системы (если нужно)
+# Для некоторых зависимостей нужен компилятор
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
-    && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/*
 
-# Копирование зависимостей
+# Ставим зависимости
 COPY requirements.txt .
-
-# Установка Python пакетов
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копирование исходного кода
+# Копируем код бота
 COPY . .
 
-# Запуск бота
+# Команда по умолчанию (Railway все равно переопределит startCommand из railway.json)
 CMD ["python", "bot.py"]
