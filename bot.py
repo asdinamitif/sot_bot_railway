@@ -45,7 +45,8 @@ SCHEDULE_URL = os.getenv("SCHEDULE_URL", "").strip()
 REMARKS_URL = os.getenv("REMARKS_URL", "").strip()
 
 SCHEDULE_PATH = os.getenv("SCHEDULE_PATH", "schedule.xlsx")
-REMARKS_PATH = os.getenv("REMARKS_PATH", "remarks.xlsx")
+# >>> по умолчанию работаем с remarks2.xlsx <<<
+REMARKS_PATH = os.getenv("REMARKS_PATH", "remarks2.xlsx")
 
 SCHEDULE_SYNC_TTL_SEC = int(os.getenv("SCHEDULE_SYNC_TTL_SEC", "3600"))
 REMARKS_SYNC_TTL_SEC = int(os.getenv("REMARKS_SYNC_TTL_SEC", "3600"))
@@ -689,7 +690,7 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
         dt_raw = r["decided_at"] or ""
         try:
             dt_obj = datetime.fromisoformat(dt_raw)
-            dt_str = dt_obj.strftime("%d.%m.%Y %H:%M")
+            dt_str = dt_obj.strftime("%d.%m.%Y %H:%М")
         except Exception:
             dt_str = dt_raw
 
@@ -1177,7 +1178,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         for _, r in df2.head(50).iterrows():
             d = ""
             try:
-                d = pd.to_datetime(r[col_date]).strftime("%d.%m.%Y")
+                d = pd.to_datetime(r[col_date]).strftime("%d.%м.%Y")
             except Exception:
                 d = str(r[col_date])
             lines.append(f"• {d} — {r.to_dict()}")
@@ -1362,7 +1363,7 @@ async def handle_inspector_step(update: Update, context: ContextTypes.DEFAULT_TY
 
     if step == "date":
         try:
-            d = datetime.strptime(text, "%d.%m.%Y").date()
+            d = datetime.strptime(text, "%d.%м.%Y").date()
         except Exception:
             await update.message.reply_text(
                 "Не понял дату. Введите в формате ДД.ММ.ГГГГ, например 03.12.2025."
