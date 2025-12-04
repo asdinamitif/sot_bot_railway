@@ -172,8 +172,6 @@ def read_sheet_to_dataframe(
     except Exception as e:
         log.error("Ошибка чтения листа '%s' из Google Sheets: %s", sheet_name, e)
         return None
-
-
 # -------------------------------------------------
 # Работа со столбцами Excel
 # -------------------------------------------------
@@ -292,7 +290,7 @@ def get_schedule_state() -> dict:
 def get_schedule_version(settings: dict) -> int:
     try:
         return int(settings.get("schedule_version") or "1")
-    except Exception:
+    except:
         return 1
 
 
@@ -382,9 +380,7 @@ def build_schedule_inline(is_admin_flag: bool, settings: dict):
         [InlineKeyboardButton("📤 Загрузить", callback_data="schedule_upload")],
     ]
     if is_admin_flag:
-        buttons.append(
-            [InlineKeyboardButton("👥 Согласующие", callback_data="schedule_approvers")]
-        )
+        buttons.append([InlineKeyboardButton("👥 Согласующие", callback_data="schedule_approvers")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -398,15 +394,7 @@ def remarks_menu_inline() -> InlineKeyboardMarkup:
 
 
 def inspector_menu_inline() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "➕ Добавить выезд", callback_data="inspector_add"
-                )
-            ]
-        ]
-    )
+    return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Добавить выезд", callback_data="inspector_add")]])
 
 
 # -------------------------------------------------
@@ -444,7 +432,7 @@ def _format_dt(iso_str: Optional[str]) -> str:
     try:
         dt = datetime.fromisoformat(iso_str)
         return dt.strftime("%d.%m.%Y %H:%M")
-    except Exception:
+    except:
         return iso_str
 
 
@@ -496,8 +484,6 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
             lines.append(f"• {r['approver']} — {_format_dt(r['decided_at'])} ✅")
 
     return "\n".join(lines)
-
-
 # -------------------------------------------------
 # Замечания: НЕ УСТРАНЕНЫ
 # -------------------------------------------------
@@ -531,7 +517,7 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
             return False
         return text.startswith("нет")
 
-    grouped: Dict[str, Dict[str, set]] = {}
+    grouped = {}
 
     for _, row in df.iterrows():
         case = str(row.iloc[idx_case]).strip()
@@ -573,20 +559,11 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     for case, blocks in grouped.items():
         parts = []
         if blocks["pb"]:
-            parts.append(
-                "Пожарная безопасность: "
-                + ", ".join(b + " - нет" for b in sorted(blocks["pb"]))
-            )
+            parts.append("Пожарная безопасность: " + ", ".join(b + " - нет" for b in blocks["pb"]))
         if blocks["ar"]:
-            parts.append(
-                "Архитектура, ММГН, АГО: "
-                + ", ".join(b + " - нет" for b in sorted(blocks["ar"]))
-            )
+            parts.append("Архитектура, ММГН, АГО: " + ", ".join(b + " - нет" for b in blocks["ar"]))
         if blocks["eom"]:
-            parts.append(
-                "Электроснабжение: "
-                + ", ".join(b + " - нет" for b in sorted(blocks["eom"]))
-            )
+            parts.append("Электроснабжение: " + ", ".join(b + " - нет" for b in blocks["eom"]))
         lines.append(f"• {case} — " + "; ".join(parts))
 
     return "\n".join(lines)
@@ -595,7 +572,7 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
 # -------------------------------------------------
 # Отправка длинного текста
 # -------------------------------------------------
-async def send_long_text(chat, text: str, chunk_size: int = 3500):
+async def send_long_text(chat, text: str, chunk_size=3500):
     lines = text.split("\n")
     buf = ""
 
@@ -611,7 +588,7 @@ async def send_long_text(chat, text: str, chunk_size: int = 3500):
 
 
 # -------------------------------------------------
-# Считывание листа замечаний (текущий год)
+# Считывание всех листов замечаний
 # -------------------------------------------------
 def get_remarks_df_current() -> Optional[pd.DataFrame]:
     sheet = get_current_remarks_sheet_name()
@@ -624,13 +601,63 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
         if sheet not in xls.sheet_names:
             return None
         return pd.read_excel(xls, sheet_name=sheet)
-    except Exception as e:
-        log.error("Ошибка чтения листа замечаний: %s", e)
+    except:
         return None
 
 
 # -------------------------------------------------
-# Инспектор — пошаговое заполнение (демо)
+# Функция записи инспектора в Google Sheets
+# -------------------------------------------------
+def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
+    service = get_sheets_service()
+    if service is None:
+        log.error("Google Sheets API недоступен.")
+        return False
+
+    try:
+        D_value = (
+            f"Площадь (кв.м): {form.get('area', '')}; "
+            f"Количество этажей: {form.get('floors', '')}"
+        )
+
+        row = [
+            "",  # A
+            form.get("date").strftime("%d.%m.%Y") if form.get("date") else "",  # B дата
+            "",  # C
+            D_value,  # D объединённые площадь + этажи
+            form.get("onzs", ""),  # E
+            form.get("developer", ""),  # F
+            form.get("object", ""),  # G
+            form.get("address", ""),  # H
+            form.get("case", ""),  # I
+            form.get("check_type", ""),  # J вид проверки
+        ]
+
+        body = {"values": [row]}
+
+        response = (
+            service.spreadsheets()
+            .values()
+            .append(
+                spreadsheetId=GSHEETS_SPREADSHEET_ID,
+                range=f"'{INSPECTOR_SHEET_NAME}'!A1",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body=body,
+            )
+            .execute()
+        )
+
+        log.info("Инспектор: запись добавлена: %s", response)
+        return True
+
+    except Exception as e:
+        log.error("Ошибка записи инспектора в Google Sheets: %s", e)
+        return False
+
+
+# -------------------------------------------------
+# Инспектор — пошаговое заполнение
 # -------------------------------------------------
 async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -642,7 +669,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
             form["date"] = datetime.strptime(text, "%d.%m.%Y").date()
             form["step"] = "area"
             await update.message.reply_text("Площадь (кв.м):")
-        except Exception:
+        except:
             await update.message.reply_text("Введите дату в формате ДД.ММ.ГГГГ")
         return
 
@@ -684,12 +711,21 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if step == "case":
         form["case"] = text
+        form["step"] = "check_type"
+        await update.message.reply_text("Введите вид проверки (ПП, итоговая, профвизит):")
+        return
+
+    if step == "check_type":
+        form["check_type"] = text
         form["step"] = "done"
 
         await update.message.reply_text("Записываю в Google Sheets...")
 
-        # запись отключена в этой версии (демо)
-        await update.message.reply_text("Готово (демо-режим).")
+        ok = append_inspector_row_to_excel(form)
+        if ok:
+            await update.message.reply_text("Выезд успешно записан в таблицу.")
+        else:
+            await update.message.reply_text("Ошибка записи в таблицу.")
 
         context.user_data["inspector_form"] = None
         return
@@ -699,8 +735,8 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ОНзС — клавиатура и вывод по цифре 1–12
 # -------------------------------------------------
 def onzs_menu_inline() -> InlineKeyboardMarkup:
-    buttons: List[List[InlineKeyboardButton]] = []
-    row: List[InlineKeyboardButton] = []
+    buttons = []
+    row = []
     for i in range(1, 13):
         row.append(InlineKeyboardButton(str(i), callback_data=f"onzs_filter_{i}"))
         if len(row) == 4:
@@ -712,11 +748,6 @@ def onzs_menu_inline() -> InlineKeyboardMarkup:
 
 
 def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
-    """
-    Ищет все строки в листе ПБ, АР,ММГН, АГО (2025),
-    где столбец E (ОНзС) == number.
-    Выводит: номер дела + адрес (если найден).
-    """
     col_case = get_col_by_letter(df, "I")   # Номер дела
     col_onzs = get_col_by_letter(df, "E")   # ОНзС
     col_addr = get_col_by_letter(df, "H")   # Адрес
@@ -740,8 +771,6 @@ def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
             lines.append(f"• {case_no}")
 
     return "\n".join(lines)
-
-
 # -------------------------------------------------
 # CALLBACK HANDLER
 # -------------------------------------------------
@@ -760,17 +789,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if df is None:
             await query.message.reply_text("Не удалось прочитать лист «График».")
         else:
-            await query.message.reply_text(
-                f"Лист «График» прочитан, строк: {len(df)}."
-            )
+            await query.message.reply_text(f"Лист «График» прочитан, строк: {len(df)}.")
         return
 
     if data == "schedule_download":
         df = get_schedule_df()
         if df is None or df.empty:
-            await query.message.reply_text(
-                "Не удалось получить лист «График» для выгрузки."
-            )
+            await query.message.reply_text("Не удалось получить лист «График» для выгрузки.")
             return
 
         buf = BytesIO()
@@ -786,16 +811,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "schedule_upload":
-        await query.message.reply_text(
-            "Загрузка графика в этой сборке не реализована."
-        )
+        await query.message.reply_text("Загрузка графика в этой сборке не реализована.")
         return
 
     if data == "schedule_approvers":
         if not is_admin(user.id):
-            await query.message.reply_text(
-                "Только администратор может настраивать согласующих."
-            )
+            await query.message.reply_text("Только администратор может настраивать согласующих.")
             return
         context.user_data["awaiting_approvers_input"] = {"version": version}
         await query.message.reply_text(
@@ -804,7 +825,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Нажатия по согласованию (только для своего @username)
+    # ---------- Согласование графика ----------
     if data.startswith("schedule_approve:") or data.startswith("schedule_rework:"):
         action, approver_tag = data.split(":", 1)
         user_username = user.username or ""
@@ -819,9 +840,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "schedule_approve":
             update_schedule_approval_status(version, approver_tag, "approved", None)
-            await query.message.reply_text(
-                f"{approver_tag} согласовал(а) график. Спасибо!"
-            )
+            await query.message.reply_text(f"{approver_tag} согласовал(а) график. Спасибо!")
             return
 
         if action == "schedule_rework":
@@ -829,9 +848,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "version": version,
                 "approver": approver_tag,
             }
-            await query.message.reply_text(
-                "Напишите комментарий, почему график нужно доработать."
-            )
+            await query.message.reply_text("Напишите комментарий, почему график нужно доработать.")
             return
 
     # ---------- ЗАМЕЧАНИЯ ----------
@@ -854,7 +871,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---------- ОНзС 1–12 ----------
+    # ---------- ОНЗС (1–12) ----------
     if data.startswith("onzs_filter_"):
         number = data.replace("onzs_filter_", "")
         df = get_remarks_df_current()
@@ -865,7 +882,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_text(query.message.chat, text)
         return
 
-    # ---------- Инспектор ----------
+    # ---------- ИНСПЕКТОР ----------
     if data == "inspector_add":
         context.user_data["inspector_form"] = {"step": "date"}
         await query.message.reply_text("Дата выезда (ДД.ММ.ГГГГ):")
@@ -879,7 +896,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     chat = update.message.chat
 
-    # --- комментарий к «На доработку» ---
+    # --- комментарий от "На доработку" ---
     if context.user_data.get("awaiting_rework_comment"):
         info = context.user_data.pop("awaiting_rework_comment")
         version = info["version"]
@@ -891,13 +908,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- ввод списка согласующих админом ---
+    # --- ввод согласующих ---
     if context.user_data.get("awaiting_approvers_input"):
         info = context.user_data.pop("awaiting_approvers_input")
         version = info["version"]
 
         raw = text.replace(",", " ").split()
-        approvers: List[str] = []
+        approvers = []
         for token in raw:
             token = token.strip()
             if not token:
@@ -908,14 +925,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         approvers = list(dict.fromkeys(approvers))
 
         if not approvers:
-            await update.message.reply_text(
-                "Не найдено ни одного юзернейма. Повторите настройку согласующих."
-            )
+            await update.message.reply_text("Не найдено ни одного юзернейма.")
             return
 
         set_current_approvers_for_version(approvers, version)
 
-        # сообщение согласующим (в этот же чат)
         lines = [
             "График на новую неделю, необходимо согласовать.",
             f"Версия: {version}",
@@ -924,29 +938,26 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         for a in approvers:
             lines.append(f"• {a}")
-        txt = "\n".join(lines)
 
-        buttons: List[List[InlineKeyboardButton]] = []
-        for a in approvers:
-            buttons.append(
+        kb = InlineKeyboardMarkup(
+            [
                 [
                     InlineKeyboardButton(
-                        f"✅ Согласовать ({a})",
-                        callback_data=f"schedule_approve:{a}",
+                        f"✅ Согласовать ({a})", callback_data=f"schedule_approve:{a}"
                     ),
                     InlineKeyboardButton(
-                        f"✏️ На доработку ({a})",
-                        callback_data=f"schedule_rework:{a}",
+                        f"✏️ На доработку ({a})", callback_data=f"schedule_rework:{a}"
                     ),
                 ]
-            )
-        kb = InlineKeyboardMarkup(buttons)
+                for a in approvers
+            ]
+        )
 
-        await chat.send_message(txt, reply_markup=kb)
+        await chat.send_message("\n".join(lines), reply_markup=kb)
         await update.message.reply_text("Согласующие сохранены и уведомлены.")
         return
 
-    # --- Инспектор (пошаговый мастер) ---
+    # --- обработка инспектора ---
     if context.user_data.get("inspector_form"):
         await inspector_process(update, context)
         return
@@ -993,18 +1004,18 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
         if not rows:
-            await update.message.reply_text(
-                "Пока нет данных по согласованию графика."
-            )
+            await update.message.reply_text("Пока нет данных по согласованию графика.")
             return
 
         lines = ["📈 Аналитика по согласованию графика:", ""]
         cur_ver = None
+
         for r in rows:
             ver = r["version"]
             if ver != cur_ver:
                 cur_ver = ver
                 lines.append(f"\nВерсия {ver}:")
+
             appr = r["approver"]
             status = r["status"] or "pending"
             decided = _format_dt(r["decided_at"])
@@ -1017,15 +1028,14 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"• {appr} — Согласовано {decided} ✅")
             elif status == "rework":
                 if comment:
-                    lines.append(
-                        f"• {appr} — На доработку {decided} (Комментарий: {comment})"
-                    )
+                    lines.append(f"• {appr} — На доработку {decided} (Комментарий: {comment})")
                 else:
                     lines.append(f"• {appr} — На доработку {decided}")
+
         await send_long_text(chat, "\n".join(lines))
         return
 
-    # По умолчанию
+    # --- DEFAULT ---
     await update.message.reply_text(
         "Я вас не понял. Выберите пункт меню или нажмите /start.",
         reply_markup=main_menu(),
@@ -1037,7 +1047,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------------------------------------
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Загрузка файлов в этой версии бота отключена. Используйте Google Sheets."
+        "Загрузка файлов отключена. Используйте Google Sheets."
     )
 
 
@@ -1069,7 +1079,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         log.error("BOT_TOKEN не задан.")
-        raise SystemExit("Укажите BOT_TOKEN в .env или переменных окружения.")
+        raise SystemExit("Укажите BOT_TOKEN.")
 
     init_db()
 
@@ -1089,3 +1099,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
