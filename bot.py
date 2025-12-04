@@ -3,7 +3,7 @@ import os
 import sqlite3
 from datetime import datetime, timedelta, date
 from io import BytesIO
-from typing import Optional, Dict, Any, List, Any as AnyType
+from typing import Optional, Dict, Any, List
 
 import json
 import requests
@@ -26,6 +26,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+AnyType = Any
 
 # ----------------- ЛОГИ -----------------
 logging.basicConfig(
@@ -65,7 +67,7 @@ DEFAULT_APPROVERS = [
     "@Kirill_Victorovi4",
 ]
 
-RESPONSIBLE_USERNAMES = {
+RESPONSIBLE_USERNAMES: Dict[str, List[str]] = {
     "бектяшкин": ["sergeybektiashkin"],
     "смирнов": ["scri4"],
 }
@@ -236,7 +238,7 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
     if isinstance(date_fin, datetime):
         fin_str = date_fin.strftime("%d.%m.%Y")
     elif isinstance(date_fin, date):
-        fin_str = date_fin.strftime("%d.%м.%Y")
+        fin_str = date_fin.strftime("%d.%m.%Y")
     else:
         fin_str = str(date_fin or "")
 
@@ -294,19 +296,6 @@ def init_db() -> None:
     c = conn.cursor()
 
     c.execute(
-        """CREATE TABLE IF NOT EXISTS approvals (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               user_id INTEGER,
-               username TEXT,
-               approver TEXT,
-               decision TEXT,
-               comment TEXT,
-               decided_at TEXT,
-               schedule_version INTEGER
-           )"""
-    )
-
-    c.execute(
         """CREATE TABLE IF NOT EXISTS schedule_settings (
                key TEXT PRIMARY KEY,
                value TEXT
@@ -317,45 +306,6 @@ def init_db() -> None:
         """CREATE TABLE IF NOT EXISTS approvers (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                label TEXT UNIQUE
-           )"""
-    )
-
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS remarks_status (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               excel_row INTEGER,
-               pb_status TEXT,
-               pbzk_status TEXT,
-               ar_status TEXT,
-               updated_by INTEGER,
-               updated_at TEXT
-           )"""
-    )
-
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS attachments (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               excel_row INTEGER,
-               file_id TEXT,
-               file_name TEXT,
-               uploaded_by INTEGER,
-               uploaded_at TEXT
-           )"""
-    )
-
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS users (
-               user_id INTEGER PRIMARY KEY,
-               username TEXT,
-               first_seen_at TEXT
-           )"""
-    )
-
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS admins (
-               user_id INTEGER PRIMARY KEY,
-               username TEXT,
-               first_seen_at TEXT
            )"""
     )
 
@@ -423,11 +373,9 @@ def get_current_approvers(settings: dict) -> List[str]:
         items = [v.strip() for v in val.split(",") if v.strip()]
         if items:
             return items
-
     val2 = settings.get("current_approver")
     if val2:
         return [val2]
-
     return []
 
 
@@ -496,19 +444,13 @@ def build_schedule_inline(is_admin_flag: bool, settings: dict) -> InlineKeyboard
             InlineKeyboardButton("📥 Скачать", callback_data="schedule_download"),
         ]
     ]
-
+    buttons.append(
+        [InlineKeyboardButton("📤 Загрузить", callback_data="schedule_upload")]
+    )
     if is_admin_flag:
         buttons.append(
-            [
-                InlineKeyboardButton("📤 Загрузить", callback_data="schedule_upload"),
-                InlineKeyboardButton("👥 Согласующие", callback_data="schedule_approvers"),
-            ]
+            [InlineKeyboardButton("👥 Согласующие", callback_data="schedule_approvers")]
         )
-    else:
-        buttons.append(
-            [InlineKeyboardButton("📤 Загрузить", callback_data="schedule_upload")]
-        )
-
     return InlineKeyboardMarkup(buttons)
 
 
@@ -574,15 +516,7 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
 # Замечания: НЕ УСТРАНЕНЫ
 # -------------------------------------------------
 def build_remarks_not_done_text(df: pd.DataFrame) -> str:
-    """Строит список дел, где в статусных колонках (Q, R, X, AD) стоит «нет».
-    Колонки берём ЖЁСТКО по буквам Excel:
-
-    I  – номер дела
-    Q  – Отметка об устранении замечаний ПБ да/нет
-    R  – Отметка об устранении замечаний ПБ в ЗК КНД да/нет
-    X  – Отметка об устранении нарушений АР, ММГН, АГО да/нет
-    AD – Отметка об устранении нарушений ЭОМ да/нет
-    """
+    """Строит список дел, где в статусных колонках (Q, R, X, AD) стоит «нет»."""
 
     COL_LETTERS = {
         "case": "I",
@@ -606,7 +540,6 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     idx_eom = excel_col_to_index(COL_LETTERS["eom"])
 
     def is_net_value(val: AnyType) -> bool:
-        """True, если ячейка начинается со слова «нет» (с учётом грязных пробелов)."""
         if val is None:
             return False
         text = str(val)
@@ -693,7 +626,7 @@ async def send_long_text(chat, text: str, chunk_size: int = 3500):
             await chat.send_message(buf)
             buf = line
         else:
-            buf = buf + "\n" + line если buf else line
+            buf = (buf + "\n" + line) if buf else line
 
     if buf:
         await chat.send_message(buf)
