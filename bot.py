@@ -610,12 +610,17 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
 
 def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     """
-    Строки, где В КАКОЙ-ЛИБО из 4 статусных колонок стоит ровно «нет».
+    Строит список дел, где в статусных колонках стоит «нет».
 
-    Для каждой строки/дела показываем:
-    • номер дела — Пожарная безопасность (Отметка об устранении замечаний ПБ да/нет); ...
+    Группировка по блокам:
+    - Пожарная безопасность
+    - Архитектура, ММГН, АГО
+    - Электроснабжение (ЭОМ)
 
-    Пустые ячейки, '-', 'н/д' и любые другие значения игнорируются.
+    Формат строки:
+    • 07-12-129500 — Пожарная безопасность: Отметка об устранении замечаний ПБ да/нет - нет,
+      Отметка об устранении замечаний ПБ в ЗК КНД да/нет - нет;
+      Электроснабжение: Отметка об устранении нарушений ЭОМ да/нет - нет
     """
 
     df_copy = df.copy()
@@ -631,43 +636,62 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     if not col_case:
         return "Не удалось определить колонку с номером дела (I)."
 
-    # --- статусные колонки: сначала ищем по тексту, потом по букве ---
-    # 1) Отметка об устранении замечаний ПБ да/нет  (обычно Q)
+    # --- статусные колонки: ПБ, ПБ в ЗК КНД, АР/ММГН/АГО, ЭОМ ---
+    # Пожарная безопасность (основная) – обычно Q
     col_pb = (
         find_status_col(
             df_copy,
-            include=["отметка", "устран", "пб", "да/нет"],
+            include=["отметка", "устран", "пб"],
             exclude=["зк", "кнд"],
         )
         or get_col_by_letter(df_copy, "Q")
     )
 
-    # 2) Отметка об устранении замечаний ПБ в ЗК КНД да/нет  (обычно R)
+    # Пожарная безопасность в ЗК КНД – обычно R
     col_pb_zk = (
         find_status_col(
             df_copy,
-            include=["отметка", "устран", "пб", "зк", "кнд", "да/нет"],
+            include=["отметка", "устран", "пб", "зк", "кнд"],
         )
         or get_col_by_letter(df_copy, "R")
     )
 
-    # 3) Отметка об устранении нарушений АР, ММГН, АГО да/нет  (чаще X)
+    # Архитектура, ММГН, АГО – часто X
     col_ar = (
         find_status_col(
             df_copy,
-            include=["отметка", "устран", "ар", "ммгн", "аго", "да/нет"],
+            include=["отметка", "устран", "ар"],
+        )
+        or find_status_col(
+            df_copy,
+            include=["отметка", "устран", "ммгн"],
+        )
+        or find_status_col(
+            df_copy,
+            include=["отметка", "устран", "аго"],
         )
         or get_col_by_letter(df_copy, "X")
     )
 
-    # 4) Отметка об устранении нарушений ЭОМ да/нет  (обычно AE)
+    # ЭОМ – обычно AE, но на всякий случай ищем по слову "эом"
     col_eom = (
         find_status_col(
             df_copy,
-            include=["отметка", "устран", "эом", "да/нет"],
+            include=["отметка", "устран", "эом"],
         )
         or get_col_by_letter(df_copy, "AE")
     )
+    if not col_eom:
+        for col in df_copy.columns:
+            if "эом" in str(col).lower():
+                col_eom = col
+                break
+
+    # Человекочитаемые названия колонок
+    TITLE_PB = "Отметка об устранении замечаний ПБ да/нет"
+    TITLE_PB_ZK = "Отметка об устранении замечаний ПБ в ЗК КНД да/нет"
+    TITLE_AR = "Отметка об устранении нарушений АР, ММГН, АГО да/нет"
+    TITLE_EOM = "Отметка об устранении нарушений ЭОМ да/нет"
 
     def is_net(row, col_name: Optional[str]) -> bool:
         """True ТОЛЬКО если в ячейке ровно «нет» (пробелы/регистр не важны)."""
@@ -683,71 +707,70 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
             return False
         return text == "нет"
 
-    has_no: List[tuple[str, List[str]]] = []
+    # grouped[case_no] = {"pb": set(str), "ar": set(str), "eom": set(str)}
+    grouped: Dict[str, Dict[str, set]] = {}
 
     for _, row in df_copy.iterrows():
         case_val = str(row.get(col_case, "")).strip()
         if not case_val:
             continue
 
-        blocks: List[str] = []
+        pb_cols = set()
+        ar_cols = set()
+        eom_cols = set()
 
-        # Пожарная безопасность – основная колонка
         if is_net(row, col_pb):
-            blocks.append(
-                f"Пожарная безопасность ({col_pb})"
-                if col_pb
-                else "Пожарная безопасность"
-            )
-
-        # Пожарная безопасность в ЗК КНД
+            pb_cols.add(TITLE_PB)
         if is_net(row, col_pb_zk):
-            blocks.append(
-                f"Пожарная безопасность в ЗК КНД ({col_pb_zk})"
-                if col_pb_zk
-                else "Пожарная безопасность в ЗК КНД"
-            )
-
-        # Архитектура / ММГН / АГО
+            pb_cols.add(TITLE_PB_ZK)
         if is_net(row, col_ar):
-            blocks.append(
-                f"Архитектура, ММГН, АГО ({col_ar})"
-                if col_ar
-                else "Архитектура, ММГН, АГО"
-            )
-
-        # Электроснабжение (ЭОМ)
+            ar_cols.add(TITLE_AR)
         if is_net(row, col_eom):
-            blocks.append(
-                f"Электроснабжение (ЭОМ) ({col_eom})"
-                if col_eom
-                else "Электроснабжение (ЭОМ)"
-            )
+            eom_cols.add(TITLE_EOM)
 
-        # Если в строке ни в одной колонке нет «нет» – пропускаем
-        if not blocks:
+        # Если ни в одной колонке нет «нет» – пропускаем
+        if not (pb_cols or ar_cols or eom_cols):
             continue
 
-        has_no.append((case_val, blocks))
+        if case_val not in grouped:
+            grouped[case_val] = {"pb": set(), "ar": set(), "eom": set()}
 
-    if not has_no:
+        grouped[case_val]["pb"].update(pb_cols)
+        grouped[case_val]["ar"].update(ar_cols)
+        grouped[case_val]["eom"].update(eom_cols)
+
+    if not grouped:
         return "Во всех строках статусы устранения не содержат «нет»."
-
-    # Группируем по делу, чтобы не было дублей
-    grouped: Dict[str, List[str]] = {}
-    for case_no, blocks in has_no:
-        grouped.setdefault(case_no, [])
-        for b in blocks:
-            if b not in grouped[case_no]:
-                grouped[case_no].append(b)
 
     lines = [
         "Строки со статусом «НЕ УСТРАНЕНЫ (нет)»",
         f"Лист: «{get_current_remarks_sheet_name()}»",
         "",
     ]
+
     for case_no, blocks in grouped.items():
-        lines.append(f"• {case_no} — " + "; ".join(blocks))
+        parts: List[str] = []
+
+        if blocks["pb"]:
+            pb_part = "Пожарная безопасность: " + ", ".join(
+                f"{name} - нет" for name in sorted(blocks["pb"])
+            )
+            parts.append(pb_part)
+
+        if blocks["ar"]:
+            ar_part = "Архитектура, ММГН, АГО: " + ", ".join(
+                f"{name} - нет" for name in sorted(blocks["ar"])
+            )
+            parts.append(ar_part)
+
+        if blocks["eom"]:
+            eom_part = "Электроснабжение: " + ", ".join(
+                f"{name} - нет" for name in sorted(blocks["eom"])
+            )
+            parts.append(eom_part)
+
+        line = f"• {case_no} — " + "; ".join(parts)
+        lines.append(line)
 
     return "\n".join(lines)
 
