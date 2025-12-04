@@ -910,7 +910,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if data == "remarks_not_done":
-        df = get_remarks_df()
+        # Обязательно что-то отвечаем сразу
+        await query.message.reply_text("Ищу строки со статусом «нет» в файле замечаний...")
+
+        try:
+            df = get_remarks_df()
+        except Exception as e:
+            log.exception("Критическая ошибка в get_remarks_df: %s", e)
+            await query.message.reply_text(
+                "Произошла внутренняя ошибка при чтении файла замечаний."
+            )
+            return
+
         if df is None:
             await query.message.reply_text(
                 "Не удалось получить файл замечаний. "
@@ -918,7 +929,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
-        text = build_remarks_not_done_text(df)
+        try:
+            text = build_remarks_not_done_text(df)
+        except Exception as e:
+            log.exception("Ошибка в build_remarks_not_done_text: %s", e)
+            await query.message.reply_text(
+                "Не удалось сформировать список неустранённых замечаний."
+            )
+            return
+
         await query.message.reply_text(text)
         return
 
