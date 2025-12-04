@@ -260,7 +260,7 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
     if isinstance(date_fin, datetime):
         fin_str = date_fin.strftime("%d.%m.%Y")
     elif isinstance(date_fin, date):
-        fin_str = date_fin.strftime("%d.%m.%Y")
+        fin_str = date_fin.strftime("%d.%м.%Y")
     else:
         fin_str = str(date_fin or "")
 
@@ -596,79 +596,49 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
 
 def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     """
-    Строит список дел, где в статусных колонках стоит «нет».
+    Строит список дел, где в статусных колонках (Q, R, X, AD) стоит ровно «нет».
+    Колонки берём ЖЁСТКО по буквам Excel, без попыток угадать заголовки:
 
-    Группировка по блокам:
-    - Пожарная безопасность
-    - Архитектура, ММГН, АГО
-    - Электроснабжение (ЭОМ)
+    I  – номер дела
+    Q  – Отметка об устранении замечаний ПБ да/нет
+    R  – Отметка об устранении замечаний ПБ в ЗК КНД да/нет
+    X  – Отметка об устранении нарушений АР, ММГН, АГО да/нет
+    AD – Отметка об устранении нарушений ЭОМ да/нет
     """
 
-    df_copy = df.copy()
+    COL_LETTERS = {
+        "case": "I",
+        "pb": "Q",
+        "pb_zk": "R",
+        "ar": "X",
+        "eom": "AD",
+    }
 
-    # Номер дела (I)
-    col_case = find_col(
-        df_copy,
-        ["дело", "номер дела", "номер_дела", "номер дела (номер объекта)"],
-    )
-    if not col_case:
-        col_case = get_col_by_letter(df_copy, "I")
-    if not col_case:
-        return "Не удалось определить колонку с номером дела (I)."
+    TITLES = {
+        "pb": "Отметка об устранении замечаний ПБ да/нет",
+        "pb_zk": "Отметка об устранении замечаний ПБ в ЗК КНД да/нет",
+        "ar": "Отметка об устранении нарушений АР, ММГН, АГО да/нет",
+        "eom": "Отметка об устранении нарушений ЭОМ да/нет",
+    }
 
-    # Пожарная безопасность
-    col_pb = (
-        find_status_col(
-            df_copy,
-            include=["отметка", "устран", "пб"],
-            exclude=["зк", "кнд"],
+    idx_case = excel_col_to_index(COL_LETTERS["case"])
+    idx_pb = excel_col_to_index(COL_LETTERS["pb"])
+    idx_pb_zk = excel_col_to_index(COL_LETTERS["pb_zk"])
+    idx_ar = excel_col_to_index(COL_LETTERS["ar"])
+    idx_eom = excel_col_to_index(COL_LETTERS["eom"])
+
+    max_idx = max(idx_case, idx_pb, idx_pb_zk, idx_ar, idx_eom)
+    if df.shape[1] <= max_idx:
+        return (
+            "Структура файла замечаний не соответствует ожидаемой: "
+            "меньше столбцов, чем требуется (I, Q, R, X, AD)."
         )
-        or get_col_by_letter(df_copy, "Q")
-    )
 
-    # ПБ в ЗК КНД
-    col_pb_zk = (
-        find_status_col(
-            df_copy,
-            include=["отметка", "устран", "пб", "зк", "кнд"],
-        )
-        or get_col_by_letter(df_copy, "R")
-    )
-
-    # Архитектура, ММГН, АГО
-    col_ar = (
-        find_status_col(df_copy, include=["отметка", "устран", "ар"])
-        or find_status_col(df_copy, include=["отметка", "устран", "ммгн"])
-        or find_status_col(df_copy, include=["отметка", "устран", "аго"])
-        or get_col_by_letter(df_copy, "X")
-    )
-
-    # ЭОМ – гарантированно ищем в AD, потом AE, потом автоопределение
-    col_eom = (
-        find_status_col(df_copy, include=["отметка", "устран", "эом"])
-        or get_col_by_letter(df_copy, "AD")
-        or get_col_by_letter(df_copy, "AE")
-    )
-    if not col_eom:
-        for col in df_copy.columns:
-            if col in {col_pb, col_pb_zk, col_ar}:
-                continue
-            values = df_copy[col].astype(str).str.lower().str.strip()
-            if values.isin(["да", "нет"]).any():
-                col_eom = col
-                log.info("ЭОМ: автоопределена колонка %s", col)
-                break
-
-    TITLE_PB = "Отметка об устранении замечаний ПБ да/нет"
-    TITLE_PB_ZK = "Отметка об устранении замечаний ПБ в ЗК КНД да/нет"
-    TITLE_AR = "Отметка об устранении нарушений АР, ММГН, АГО да/нет"
-    TITLE_EOM = "Отметка об устранении нарушений ЭОМ да/нет"
-
-    def is_net(row, col_name: Optional[str]) -> bool:
-        """True ТОЛЬКО если в ячейке ровно «нет» (пробелы/регистр не важны)."""
-        if not col_name:
-            return False
-        val = row.get(col_name, "")
+    def is_net_value(val: Any) -> bool:
+        """
+        True, только если ячейка содержит ровно «нет» (без учёта регистра/пробелов).
+        Пустые и прочие значения не считаем.
+        """
         if val is None:
             return False
         text = str(val).strip().lower()
@@ -680,23 +650,28 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
 
     grouped: Dict[str, Dict[str, set]] = {}
 
-    for _, row in df_copy.iterrows():
-        case_val = str(row.get(col_case, "")).strip()
+    for _, row in df.iterrows():
+        case_val = str(row.iloc[idx_case]).strip()
         if not case_val:
             continue
+
+        val_pb = row.iloc[idx_pb]
+        val_pb_zk = row.iloc[idx_pb_zk]
+        val_ar = row.iloc[idx_ar]
+        val_eom = row.iloc[idx_eom]
 
         pb_cols = set()
         ar_cols = set()
         eom_cols = set()
 
-        if is_net(row, col_pb):
-            pb_cols.add(TITLE_PB)
-        if is_net(row, col_pb_zk):
-            pb_cols.add(TITLE_PB_ZK)
-        if is_net(row, col_ar):
-            ar_cols.add(TITLE_AR)
-        if is_net(row, col_eom):
-            eom_cols.add(TITLE_EOM)
+        if is_net_value(val_pb):
+            pb_cols.add(TITLES["pb"])
+        if is_net_value(val_pb_zk):
+            pb_cols.add(TITLES["pb_zk"])
+        if is_net_value(val_ar):
+            ar_cols.add(TITLES["ar"])
+        if is_net_value(val_eom):
+            eom_cols.add(TITLES["eom"])
 
         if not (pb_cols or ar_cols or eom_cols):
             continue
