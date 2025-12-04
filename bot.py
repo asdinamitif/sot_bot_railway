@@ -6,6 +6,8 @@ from typing import Optional, Dict, Any, List
 
 import pandas as pd
 import json
+import requests
+from io import BytesIO
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -46,7 +48,7 @@ GOOGLE_SHEET_URL_DEFAULT = (
     "1FlhN7grvku5tSj2SAreEHxHC55K9E7N91r8eWOkzOFY/edit?usp=sharing"
 )
 
-# Google Sheets API
+# Google Sheets
 GSHEETS_SERVICE_ACCOUNT_JSON = os.getenv("GSHEETS_SERVICE_ACCOUNT_JSON", "").strip()
 GSHEETS_SPREADSHEET_ID = os.getenv(
     "GSHEETS_SPREADSHEET_ID",
@@ -94,6 +96,7 @@ def get_current_remarks_sheet_name() -> str:
 def get_sheets_service():
     """
     Возвращает объект сервиса Google Sheets (кешируется в SHEETS_SERVICE).
+    Используется для раздела «График» и записи инспектора.
     """
     global SHEETS_SERVICE
 
@@ -105,11 +108,6 @@ def get_sheets_service():
         return None
 
     try:
-        # Диагностика: проверим, что JSON реально пришёл из ENV по длине
-        log.info(
-            "GSHEETS_SERVICE_ACCOUNT_JSON длина: %d символов",
-            len(GSHEETS_SERVICE_ACCOUNT_JSON),
-        )
         info = json.loads(GSHEETS_SERVICE_ACCOUNT_JSON)
         creds = Credentials.from_service_account_info(
             info,
@@ -126,7 +124,6 @@ def get_sheets_service():
 def build_export_url(spreadsheet_id: str) -> str:
     """
     Ссылка на экспорт Google Sheets в .xlsx по ID таблицы.
-    (Сейчас не используется, но оставляем на будущее.)
     """
     return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=xlsx"
 
@@ -984,7 +981,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if step == "date_final":
             try:
-                fin_date = datetime.strptime(text, "%d.%м.%Y").date()
+                fin_date = datetime.strptime(text, "%d.%m.%Y").date()
                 form["date_final"] = fin_date
             except Exception:
                 await update.message.reply_text(
@@ -1066,12 +1063,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 def get_schedule_df() -> Optional[pd.DataFrame]:
     """
-    Получает данные графика ТОЛЬКО через Google Sheets API.
-    Берёт первый лист в таблице GSHEETS_SPREADSHEET_ID.
+    Получает данные графика из первого листа Google Sheets.
     """
     service = get_sheets_service()
     if service is None:
-        log.error("Google Sheets сервис недоступен – не можем получить график.")
+        log.error("Google Sheets сервис недоступен – невозможно получить график.")
         return None
 
     try:
@@ -1080,15 +1076,14 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
         ).execute()
         sheets = spreadsheet.get("sheets", [])
         if not sheets:
-            log.error("Нет листов в таблице (Google Sheets API).")
+            log.error("Нет листов в таблице.")
             return None
 
         first_sheet_name = sheets[0]["properties"]["title"]
-        log.info("График: читаем лист '%s' через Google API", first_sheet_name)
         df = read_sheet_to_dataframe(GSHEETS_SPREADSHEET_ID, first_sheet_name)
         return df
     except Exception as e:
-        log.error("Ошибка получения данных графика через Google Sheets API: %s", e)
+        log.error("Ошибка получения данных графика из Google Sheets: %s", e)
         return None
 
 
@@ -1097,49 +1092,54 @@ def get_remarks_df() -> Optional[pd.DataFrame]:
     Получает данные замечаний из всех листов (кроме листа инспектора),
     добавляя колонку _sheet с названием листа.
 
-    Чтение ТОЛЬКО через Google Sheets API.
+    Читает через HTTP-экспорт Google Sheets как .xlsx
+    (без использования Google Sheets API).
     """
-    service = get_sheets_service()
-    if service is None:
-        log.error("Google Sheets сервис недоступен – не можем получить замечания.")
+    if not GSHEETS_SPREADSHEET_ID:
+        log.error("GSHEETS_SPREADSHEET_ID не задан – не можем получить замечания.")
+        return None
+
+    url = build_export_url(GSHEETS_SPREADSHEET_ID)
+    log.info("Замечания: скачиваем таблицу по HTTP: %s", url)
+
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        log.error("Ошибка HTTP-запроса при получении замечаний: %s", e)
         return None
 
     try:
-        spreadsheet = service.spreadsheets().get(
-            spreadsheetId=GSHEETS_SPREADSHEET_ID
-        ).execute()
-        sheet_props = spreadsheet.get("sheets", [])
-        if not sheet_props:
-            log.error("Нет листов в таблице (Google Sheets API).")
-            return None
-
-        frames: List[pd.DataFrame] = []
-
-        for s in sheet_props:
-            sheet_name = s["properties"]["title"]
-
-            # Лист инспектора не трогаем
-            if sheet_name == INSPECTOR_SHEET_NAME:
-                log.info("Лист '%s' пропущен как лист инспектора", sheet_name)
-                continue
-
-            log.info("Замечания: читаем лист '%s' через Google API", sheet_name)
-            df_sheet = read_sheet_to_dataframe(GSHEETS_SPREADSHEET_ID, sheet_name)
-            if df_sheet is None or df_sheet.empty:
-                continue
-
-            df_sheet["_sheet"] = sheet_name
-            frames.append(df_sheet)
-
-        if not frames:
-            log.error("Не удалось прочитать ни один лист замечаний через Google API.")
-            return None
-
-        return pd.concat(frames, ignore_index=True)
-
+        bio = BytesIO(resp.content)
+        xls = pd.ExcelFile(bio)
     except Exception as e:
-        log.error("Ошибка получения данных замечаний через Google Sheets API: %s", e)
+        log.error("Ошибка чтения Excel из HTTP-ответа: %s", e)
         return None
+
+    frames: List[pd.DataFrame] = []
+
+    for sheet_name in xls.sheet_names:
+        if sheet_name == INSPECTOR_SHEET_NAME:
+            log.info("Замечания: пропускаем лист инспектора '%s'", sheet_name)
+            continue
+
+        try:
+            df_sheet = pd.read_excel(xls, sheet_name=sheet_name)
+        except Exception as e_sheet:
+            log.error("Ошибка чтения листа '%s' из Excel: %s", sheet_name, e_sheet)
+            continue
+
+        if df_sheet is None or df_sheet.empty:
+            continue
+
+        df_sheet["_sheet"] = sheet_name
+        frames.append(df_sheet)
+
+    if not frames:
+        log.error("Не удалось прочитать ни один лист замечаний (HTTP-Excel).")
+        return None
+
+    return pd.concat(frames, ignore_index=True)
 
 
 # ----------------- Обработка документов (файлы) -----------------
