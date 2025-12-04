@@ -3,7 +3,7 @@ import os
 import sqlite3
 from datetime import datetime, timedelta, date
 from io import BytesIO
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Any as AnyType
 
 import json
 import requests
@@ -596,8 +596,8 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
 
 def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     """
-    Строит список дел, где в статусных колонках (Q, R, X, AD) стоит ровно «нет».
-    Колонки берём ЖЁСТКО по буквам Excel, без попыток угадать заголовки:
+    Строит список дел, где в статусных колонках (Q, R, X, AD) стоит «нет».
+    Колонки берём ЖЁСТКО по буквам Excel:
 
     I  – номер дела
     Q  – Отметка об устранении замечаний ПБ да/нет
@@ -634,19 +634,24 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
             "меньше столбцов, чем требуется (I, Q, R, X, AD)."
         )
 
-    def is_net_value(val: Any) -> bool:
+    def is_net_value(val: AnyType) -> bool:
         """
-        True, только если ячейка содержит ровно «нет» (без учёта регистра/пробелов).
-        Пустые и прочие значения не считаем.
+        True, если ячейка содержит «нет» (с учётом грязных пробелов),
+        и при этом в тексте нет «да».
+        Это ловит варианты типа «нет», «нет   », «нет\n» и т.п.,
+        но игнорирует «нет данных» (там есть «да»).
         """
         if val is None:
             return False
-        text = str(val).strip().lower()
+        text = str(val).replace("\xa0", " ").replace("\u00a0", " ")
+        text = text.replace("\n", " ").replace("\r", " ").strip().lower()
         if not text:
             return False
-        if text in {"-", "н/д", "нет данных"}:
+        if text in {"-", "н/д"}:
             return False
-        return text == "нет"
+        if "нет" in text and "да" not in text:
+            return True
+        return False
 
     grouped: Dict[str, Dict[str, set]] = {}
 
