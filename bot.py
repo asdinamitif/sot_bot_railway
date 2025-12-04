@@ -172,6 +172,8 @@ def read_sheet_to_dataframe(
     except Exception as e:
         log.error("Ошибка чтения листа '%s' из Google Sheets: %s", sheet_name, e)
         return None
+
+
 # -------------------------------------------------
 # Работа со столбцами Excel
 # -------------------------------------------------
@@ -484,6 +486,8 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
             lines.append(f"• {r['approver']} — {_format_dt(r['decided_at'])} ✅")
 
     return "\n".join(lines)
+
+
 # -------------------------------------------------
 # Замечания: НЕ УСТРАНЕНЫ
 # -------------------------------------------------
@@ -588,7 +592,7 @@ async def send_long_text(chat, text: str, chunk_size=3500):
 
 
 # -------------------------------------------------
-# Считывание всех листов замечаний
+# Считывание листа замечаний (текущий год)
 # -------------------------------------------------
 def get_remarks_df_current() -> Optional[pd.DataFrame]:
     sheet = get_current_remarks_sheet_name()
@@ -601,20 +605,27 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
         if sheet not in xls.sheet_names:
             return None
         return pd.read_excel(xls, sheet_name=sheet)
-    except:
+    except Exception as e:
+        log.error("Не удалось прочитать файл замечаний: %s", e)
         return None
 
 
 # -------------------------------------------------
 # Функция записи инспектора в Google Sheets
 # -------------------------------------------------
-def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
+def append_inspector_row_to_excel(form: Dict[str, Any]) -> (bool, str):
+    """
+    Добавляет строку выезда в лист INSPECTOR_SHEET_NAME.
+    Возвращает (ok, error_text).
+    """
     service = get_sheets_service()
     if service is None:
-        log.error("Google Sheets API недоступен.")
-        return False
+        msg = "Google Sheets API недоступен (нет ключа или ошибка инициализации)."
+        log.error(msg)
+        return False, msg
 
     try:
+        # объединённое значение для D:
         D_value = (
             f"Площадь (кв.м): {form.get('area', '')}; "
             f"Количество этажей: {form.get('floors', '')}"
@@ -624,16 +635,18 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
             "",  # A
             form.get("date").strftime("%d.%m.%Y") if form.get("date") else "",  # B дата
             "",  # C
-            D_value,  # D объединённые площадь + этажи
+            D_value,  # D
             form.get("onzs", ""),  # E
             form.get("developer", ""),  # F
             form.get("object", ""),  # G
             form.get("address", ""),  # H
             form.get("case", ""),  # I
-            form.get("check_type", ""),  # J вид проверки
+            form.get("check_type", ""),  # J
         ]
 
         body = {"values": [row]}
+
+        log.info("Инспектор: попытка записи в '%s': %s", INSPECTOR_SHEET_NAME, row)
 
         response = (
             service.spreadsheets()
@@ -648,12 +661,11 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
             .execute()
         )
 
-        log.info("Инспектор: запись добавлена: %s", response)
-        return True
-
+        log.info("Инспектор: запись добавлена, ответ API: %s", response)
+        return True, ""
     except Exception as e:
         log.error("Ошибка записи инспектора в Google Sheets: %s", e)
-        return False
+        return False, str(e)
 
 
 # -------------------------------------------------
@@ -669,7 +681,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
             form["date"] = datetime.strptime(text, "%d.%m.%Y").date()
             form["step"] = "area"
             await update.message.reply_text("Площадь (кв.м):")
-        except:
+        except Exception:
             await update.message.reply_text("Введите дату в формате ДД.ММ.ГГГГ")
         return
 
@@ -721,11 +733,11 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text("Записываю в Google Sheets...")
 
-        ok = append_inspector_row_to_excel(form)
+        ok, err = append_inspector_row_to_excel(form)
         if ok:
             await update.message.reply_text("Выезд успешно записан в таблицу.")
         else:
-            await update.message.reply_text("Ошибка записи в таблицу.")
+            await update.message.reply_text(f"Ошибка записи в таблицу: {err}")
 
         context.user_data["inspector_form"] = None
         return
@@ -771,6 +783,8 @@ def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
             lines.append(f"• {case_no}")
 
     return "\n".join(lines)
+
+
 # -------------------------------------------------
 # CALLBACK HANDLER
 # -------------------------------------------------
@@ -1099,6 +1113,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
