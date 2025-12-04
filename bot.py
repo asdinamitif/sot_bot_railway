@@ -283,7 +283,7 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
 
 
 # -------------------------------------------------
-# БАЗА ДАННЫХ
+# БАЗА ДАННЫХ (минимум для графика)
 # -------------------------------------------------
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -474,6 +474,42 @@ def inspector_menu_inline() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("➕ Добавить выезд", callback_data="inspector_add")],
     ]
     return InlineKeyboardMarkup(buttons)
+
+
+# -------------------------------------------------
+# График: чтение листа «График»
+# -------------------------------------------------
+def get_schedule_df() -> Optional[pd.DataFrame]:
+    """
+    Получает данные графика ТОЛЬКО с листа 'График'.
+    """
+    SCHEDULE_SHEET_NAME = "График"
+    url = build_export_url(GSHEETS_SPREADSHEET_ID)
+
+    try:
+        resp = requests.get(url, timeout=40)
+        resp.raise_for_status()
+    except Exception as e:
+        log.error("Ошибка загрузки Google Sheets (график): %s", e)
+        return None
+
+    try:
+        xls = pd.ExcelFile(BytesIO(resp.content))
+    except Exception as e:
+        log.error("Ошибка чтения XLSX (график): %s", e)
+        return None
+
+    if SCHEDULE_SHEET_NAME not in xls.sheet_names:
+        log.error("Лист '%s' отсутствует в файле!", SCHEDULE_SHEET_NAME)
+        return None
+
+    try:
+        df = pd.read_excel(xls, sheet_name=SCHEDULE_SHEET_NAME)
+        df = df.dropna(how="all").reset_index(drop=True)
+        return df
+    except Exception as e:
+        log.error("Ошибка чтения листа '%s': %s", SCHEDULE_SHEET_NAME, e)
+        return None
 
 
 # -------------------------------------------------
@@ -812,6 +848,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     await query.answer()
+
+    # === График ===
+    if data == "schedule_refresh":
+        df = get_schedule_df()
+        if df is None or df.empty:
+            await query.message.reply_text(
+                "Не удалось прочитать лист «График» из файла графика."
+            )
+        else:
+            await query.message.reply_text(
+                f"Лист «График» прочитан. Строк (без пустых): {len(df)}."
+            )
+        return
+
+    if data == "schedule_download":
+        await query.message.reply_text(
+            "Файл графика можно открыть по ссылке:\n"
+            f"{GOOGLE_SHEET_URL_DEFAULT}"
+        )
+        return
+
+    # schedule_upload / schedule_approvers пока не реализованы:
+    if data in {"schedule_upload", "schedule_approvers"}:
+        await query.message.reply_text("Эта функция пока не реализована в данной версии бота.")
+        return
 
     # === Замечания → Не устранены ===
     if data == "remarks_not_done":
