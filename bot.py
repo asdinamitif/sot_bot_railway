@@ -69,7 +69,7 @@ RESPONSIBLE_USERNAMES = {
     "смирнов": ["scri4"],
 }
 
-INSPECTOR_SHEET_NAME = "ПБ, АР,ММГН, АГО (2025)"
+INSPECTOR_SHEET_NAME = "ПБ, АР, ММГН, АГО (2025)"
 HARD_CODED_ADMINS = {398960707}
 
 SCHEDULE_NOTIFY_CHAT_ID_ENV = os.getenv("SCHEDULE_NOTIFY_CHAT_ID", "").strip()
