@@ -559,7 +559,6 @@ def inspector_menu_inline() -> InlineKeyboardMarkup:
 
 def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
     version = get_schedule_version(settings)
-    file_names = get_schedule_file_names()
     name = get_schedule_name_for_version(version)
     approvers = get_current_approvers(settings)
 
@@ -708,15 +707,11 @@ async def send_long_text(chat, text: str, chunk_size: int = 4000):
     buf = ""
 
     for line in lines:
-        # +1 за перевод строки
         if len(buf) + len(line) + 1 > chunk_size:
             await chat.send_message(buf)
             buf = line
         else:
-            if buf:
-                buf += "\n" + line
-            else:
-                buf = line
+            buf = f"{buf}\n{line}" if buf else line
 
     if buf:
         await chat.send_message(buf)
@@ -939,13 +934,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if data == "remarks_not_done":
-        # Обязательно что-то отвечаем сразу
-        await query.message.reply_text("Ищу строки со статусом «нет» в файле замечаний...")
+        await query.message.reply_text("Ищу строки со статусом «нет» в текущем листе замечаний...")
 
         try:
-            df = get_remarks_df()
+            df = get_remarks_df_current()
         except Exception as e:
-            log.exception("Критическая ошибка в get_remarks_df: %s", e)
+            log.exception("Критическая ошибка в get_remarks_df_current: %s", e)
             await query.message.reply_text(
                 "Произошла внутренняя ошибка при чтении файла замечаний."
             )
@@ -967,7 +961,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
-        # длинный текст режем на части
         await send_long_text(query.message.chat, text)
         return
 
@@ -1136,42 +1129,76 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
         return None
 
 
-def get_remarks_df() -> Optional[pd.DataFrame]:
+def get_remarks_df_current() -> Optional[pd.DataFrame]:
     """
-    Получает данные замечаний из всех листов (кроме листа инспектора),
-    добавляя колонку _sheet с названием листа.
-
-    Читает через HTTP-экспорт Google Sheets как .xlsx
-    (без использования Google Sheets API).
+    Замечания ТОЛЬКО с текущего листа:
+    «ПБ, АР,ММГН, АГО (YYYY)».
+    Используется для кнопки «❌ Не устранены».
     """
     if not GSHEETS_SPREADSHEET_ID:
         log.error("GSHEETS_SPREADSHEET_ID не задан – не можем получить замечания.")
         return None
 
     url = build_export_url(GSHEETS_SPREADSHEET_ID)
-    log.info("Замечания: скачиваем таблицу по HTTP: %s", url)
+    sheet_name = get_current_remarks_sheet_name()
+    log.info("Замечания (текущий лист): HTTP %s, лист '%s'", url, sheet_name)
 
     try:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
     except Exception as e:
-        log.error("Ошибка HTTP-запроса при получении замечаний: %s", e)
+        log.error("Ошибка HTTP-запроса при получении замечаний (current): %s", e)
         return None
 
     try:
         bio = BytesIO(resp.content)
         xls = pd.ExcelFile(bio)
     except Exception as e:
-        log.error("Ошибка чтения Excel из HTTP-ответа: %s", e)
+        log.error("Ошибка чтения Excel (current) из HTTP-ответа: %s", e)
+        return None
+
+    if sheet_name not in xls.sheet_names:
+        log.error("Лист '%s' не найден в файле замечаний.", sheet_name)
+        return None
+
+    try:
+        df = pd.read_excel(xls, sheet_name=sheet_name)
+    except Exception as e:
+        log.error("Ошибка чтения листа '%s' (current): %s", sheet_name, e)
+        return None
+
+    return df
+
+
+def get_remarks_df() -> Optional[pd.DataFrame]:
+    """
+    Замечания из ВСЕХ листов файла (для ОНзС и других задач).
+    """
+    if not GSHEETS_SPREADSHEET_ID:
+        log.error("GSHEETS_SPREADSHEET_ID не задан – не можем получить замечания.")
+        return None
+
+    url = build_export_url(GSHEETS_SPREADSHEET_ID)
+    log.info("Замечания (all): скачиваем таблицу по HTTP: %s", url)
+
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        log.error("Ошибка HTTP-запроса при получении замечаний (all): %s", e)
+        return None
+
+    try:
+        bio = BytesIO(resp.content)
+        xls = pd.ExcelFile(bio)
+    except Exception as e:
+        log.error("Ошибка чтения Excel (all) из HTTP-ответа: %s", e)
         return None
 
     frames: List[pd.DataFrame] = []
 
     for sheet_name in xls.sheet_names:
-        if sheet_name == INSPECTOR_SHEET_NAME:
-            log.info("Замечания: пропускаем лист инспектора '%s'", sheet_name)
-            continue
-
+        # Никаких пропусков — берём все листы, включая ПБ, АР,ММГН, АГО (2025)
         try:
             df_sheet = pd.read_excel(xls, sheet_name=sheet_name)
         except Exception as e_sheet:
@@ -1185,7 +1212,7 @@ def get_remarks_df() -> Optional[pd.DataFrame]:
         frames.append(df_sheet)
 
     if not frames:
-        log.error("Не удалось прочитать ни один лист замечаний (HTTP-Excel).")
+        log.error("Не удалось прочитать ни один лист замечаний (all).")
         return None
 
     return pd.concat(frames, ignore_index=True)
