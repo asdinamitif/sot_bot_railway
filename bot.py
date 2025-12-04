@@ -673,17 +673,22 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
         or get_col_by_letter(df_copy, "X")
     )
 
-    # ЭОМ – обычно AE, но на всякий случай ищем по слову "эом"
+        # ЭОМ – обычно AD/AE, но на всякий случай ищем по слову "эом"
     col_eom = (
         find_status_col(
             df_copy,
             include=["отметка", "устран", "эом"],
         )
+        # сначала пробуем AD (как у тебя), потом AE
+        or get_col_by_letter(df_copy, "AD")
         or get_col_by_letter(df_copy, "AE")
     )
     if not col_eom:
+        # если шапка без названия и стоит Unnamed, пытаемся найти колонку,
+        # где в каких-то строках встречается "эом"
         for col in df_copy.columns:
-            if "эом" in str(col).lower():
+            low = str(col).lower()
+            if "эом" in low:
                 col_eom = col
                 break
 
