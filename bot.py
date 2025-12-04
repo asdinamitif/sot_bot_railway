@@ -497,7 +497,7 @@ def get_schedule_file_names() -> Dict[int, str]:
     return res
 
 
-def get_schedule_name_for_version(version: int) -> str:
+def get_schedule_file_name_for_version(version: int) -> str:
     names = get_schedule_file_names()
     name = names.get(version)
     if name:
@@ -577,7 +577,7 @@ def inspector_menu_inline() -> InlineKeyboardMarkup:
 
 def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
     version = get_schedule_version(settings)
-    name = get_schedule_name_for_version(version)
+    name = get_schedule_file_name_for_version(version)
     approvers = get_current_approvers(settings)
 
     last_notified_version = int(settings.get("last_notified_version", "0"))
@@ -610,8 +610,7 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
 
 def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     """
-    Строит текст по строкам, где В КАКОЙ-ЛИБО из 4 статусных колонок
-    стоит ровно «нет».
+    Строки, где В КАКОЙ-ЛИБО из 4 статусных колонок стоит ровно «нет».
 
     Для каждой строки/дела показываем:
     • номер дела — Пожарная безопасность (Отметка об устранении замечаний ПБ да/нет); ...
@@ -632,33 +631,46 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     if not col_case:
         return "Не удалось определить колонку с номером дела (I)."
 
-    # --- статусные колонки: ищем по тексту заголовка ---
-    # 1) Отметка об устранении замечаний ПБ да/нет
-    col_pb = find_status_col(
-        df_copy,
-        include=["отметка", "устран", "пб", "да/нет"],
-        exclude=["зк", "кнд"],
+    # --- статусные колонки: сначала ищем по тексту, потом по букве ---
+    # 1) Отметка об устранении замечаний ПБ да/нет  (обычно Q)
+    col_pb = (
+        find_status_col(
+            df_copy,
+            include=["отметка", "устран", "пб", "да/нет"],
+            exclude=["зк", "кнд"],
+        )
+        or get_col_by_letter(df_copy, "Q")
     )
 
-    # 2) Отметка об устранении замечаний ПБ в ЗК КНД да/нет
-    col_pb_zk = find_status_col(
-        df_copy,
-        include=["отметка", "устран", "пб", "зк", "кнд", "да/нет"],
+    # 2) Отметка об устранении замечаний ПБ в ЗК КНД да/нет  (обычно R)
+    col_pb_zk = (
+        find_status_col(
+            df_copy,
+            include=["отметка", "устран", "пб", "зк", "кнд", "да/нет"],
+        )
+        or get_col_by_letter(df_copy, "R")
     )
 
-    # 3) Отметка об устранении нарушений АР, ММГН, АГО да/нет
-    col_ar = find_status_col(
-        df_copy,
-        include=["отметка", "устран", "ар", "ммгн", "аго", "да/нет"],
+    # 3) Отметка об устранении нарушений АР, ММГН, АГО да/нет  (чаще X)
+    col_ar = (
+        find_status_col(
+            df_copy,
+            include=["отметка", "устран", "ар", "ммгн", "аго", "да/нет"],
+        )
+        or get_col_by_letter(df_copy, "X")
     )
 
-    # 4) Отметка об устранении нарушений ЭОМ да/нет
-    col_eom = find_status_col(
-        df_copy,
-        include=["отметка", "устран", "эом", "да/нет"],
+    # 4) Отметка об устранении нарушений ЭОМ да/нет  (обычно AE)
+    col_eom = (
+        find_status_col(
+            df_copy,
+            include=["отметка", "устран", "эом", "да/нет"],
+        )
+        or get_col_by_letter(df_copy, "AE")
     )
 
     def is_net(row, col_name: Optional[str]) -> bool:
+        """True ТОЛЬКО если в ячейке ровно «нет» (пробелы/регистр не важны)."""
         if not col_name:
             return False
         val = row.get(col_name, "")
