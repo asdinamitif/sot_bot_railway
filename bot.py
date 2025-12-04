@@ -284,7 +284,7 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
 
 
 # -------------------------------------------------
-# БАЗА ДАННЫХ (минимум для графика)
+# БАЗА ДАННЫХ (график + согласование)
 # -------------------------------------------------
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -315,6 +315,19 @@ def init_db() -> None:
                version INTEGER PRIMARY KEY,
                name TEXT,
                uploaded_at TEXT
+           )"""
+    )
+
+    # история согласований по графику
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS schedule_approvals (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               version INTEGER,
+               approver TEXT,
+               status TEXT,           -- pending / approved / rework
+               comment TEXT,
+               decided_at TEXT,
+               requested_at TEXT
            )"""
     )
 
@@ -380,6 +393,29 @@ def get_current_approvers(settings: dict) -> List[str]:
     return []
 
 
+def set_current_approvers_for_version(approvers: List[str], version: int) -> None:
+    conn = get_db()
+    c = conn.cursor()
+    # сохраняем строку настроек
+    c.execute(
+        "INSERT OR REPLACE INTO schedule_settings (key, value) "
+        "VALUES ('current_approvers', ?)",
+        (",".join(approvers),),
+    )
+    # очищаем старые статусы по этой версии
+    c.execute("DELETE FROM schedule_approvals WHERE version = ?", (version,))
+    now = local_now().isoformat()
+    for appr in approvers:
+        c.execute(
+            """INSERT INTO schedule_approvals
+               (version, approver, status, comment, decided_at, requested_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (version, appr, "pending", None, None, now),
+        )
+    conn.commit()
+    conn.close()
+
+
 def get_schedule_notify_chat_id(settings: dict) -> Optional[int]:
     val = settings.get("schedule_notify_chat_id")
     if not val:
@@ -424,6 +460,34 @@ def get_schedule_file_name_for_version(version: int) -> str:
     if name:
         return name
     return f"Версия {version}"
+
+
+def get_schedule_approvals(version: int) -> List[sqlite3.Row]:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT * FROM schedule_approvals WHERE version = ? ORDER BY approver",
+        (version,),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def update_schedule_approval_status(
+    version: int, approver: str, status: str, comment: Optional[str] = None
+) -> None:
+    conn = get_db()
+    c = conn.cursor()
+    now = local_now().isoformat()
+    c.execute(
+        """UPDATE schedule_approvals
+           SET status = ?, comment = ?, decided_at = ?
+           WHERE version = ? AND approver = ?""",
+        (status, comment, now, version, approver),
+    )
+    conn.commit()
+    conn.close()
 
 
 # -------------------------------------------------
@@ -516,10 +580,21 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
 # -------------------------------------------------
 # Тексты
 # -------------------------------------------------
+def _format_dt(iso_str: Optional[str]) -> str:
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return iso_str
+
+
 def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
     version = get_schedule_version(settings)
     name = get_schedule_file_name_for_version(version)
     approvers = get_current_approvers(settings)
+    approvals = get_schedule_approvals(version)
 
     last_notified_version = int(settings.get("last_notified_version", "0"))
     notify_chat_id = get_schedule_notify_chat_id(settings)
@@ -528,23 +603,89 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
         f"📅 График выездов (версия {version})",
         f"Файл: {name}",
     ]
+
     if approvers:
+        lines.append("")
         lines.append("Согласующие:")
-        for a in approvers:
-            lines.append(f"• {a}")
+
+        # мапа approver -> row
+        by_approver: Dict[str, sqlite3.Row] = {r["approver"]: r for r in approvals}
+
+        pending = []
+        approved = []
+        rework = []
+
+        for appr in approvers:
+            row = by_approver.get(appr)
+            if not row or row["status"] in (None, "", "pending"):
+                pending.append(appr)
+            elif row["status"] == "approved":
+                approved.append(row)
+            elif row["status"] == "rework":
+                rework.append(row)
+
+        for appr in approvers:
+            lines.append(f"• {appr}")
+
+        if rework:
+            lines.append("")
+            lines.append("Отправлено на доработку:")
+            for r in rework:
+                appr = r["approver"]
+                dt = _format_dt(r["decided_at"])
+                comment = r["comment"] or ""
+                if comment:
+                    lines.append(f"• {appr} — {dt} (Комментарий: {comment})")
+                else:
+                    lines.append(f"• {appr} — {dt} (Комментариев нет)")
+
+        elif pending:
+            lines.append("")
+            lines.append("На согласовании у:")
+            for appr in pending:
+                row = by_approver.get(appr)
+                req = _format_dt(row["requested_at"]) if row else ""
+                if req:
+                    lines.append(f"• {appr} — запрошено {req}")
+                else:
+                    lines.append(f"• {appr}")
+            if approved:
+                lines.append("")
+                lines.append("Уже согласовали:")
+                for r in approved:
+                    appr = r["approver"]
+                    dt = _format_dt(r["decided_at"])
+                    lines.append(f"• {appr} — {dt} ✅")
+        elif approved:
+            lines.append("")
+            lines.append("Согласовано:")
+            for r in approved:
+                appr = r["approver"]
+                dt = _format_dt(r["decided_at"])
+                lines.append(f"• {appr} — {dt} ✅")
+        else:
+            lines.append("")
+            lines.append("Статусы согласования пока не зафиксированы.")
     else:
+        lines.append("")
         lines.append("Согласующие не назначены.")
 
+    lines.append("")
+
     if notify_chat_id:
-        lines.append(f"\nУведомления отправляются в чат: {notify_chat_id}")
+        lines.append(f"Уведомления отправляются в чат: {notify_chat_id}")
         lines.append(f"Последняя уведомлённая версия: {last_notified_version}")
     else:
-        lines.append("\nГруппа для уведомлений по графику не настроена.")
+        lines.append("Группа для уведомлений по графику не настроена.")
 
     if is_admin_flag:
-        lines.append("\nВы администратор. Вам доступны загрузка файла и настройка согласующих.")
+        lines.append("")
+        lines.append(
+            "Вы администратор. Вам доступна загрузка файла и настройка согласующих."
+        )
     else:
-        lines.append("\nВы можете просмотреть актуальный график и скачать файл.")
+        lines.append("")
+        lines.append("Вы можете просмотреть актуальный график и скачать файл.")
 
     return "\n".join(lines)
 
@@ -848,9 +989,13 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
+    user = query.from_user
     await query.answer()
 
-    # === График ===
+    settings = get_schedule_state()
+    current_version = get_schedule_version(settings)
+
+    # === График: обновить ===
     if data == "schedule_refresh":
         df = get_schedule_df()
         if df is None or df.empty:
@@ -863,6 +1008,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # === График: скачать (только лист «График») ===
     if data == "schedule_download":
         df = get_schedule_df()
         if df is None or df.empty:
@@ -872,7 +1018,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         buf = BytesIO()
-        # создаём отдельный xlsx только с одним листом «График»
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="График", index=False)
         buf.seek(0)
@@ -884,10 +1029,61 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # schedule_upload / schedule_approvers пока не реализованы:
-    if data in {"schedule_upload", "schedule_approvers"}:
-        await query.message.reply_text("Эта функция пока не реализована в данной версии бота.")
+    # === График: согласующие (настройка) ===
+    if data == "schedule_approvers":
+        if not is_admin(user.id):
+            await query.message.reply_text(
+                "Только администратор может настраивать согласующих."
+            )
+            return
+
+        context.user_data["awaiting_approvers_input"] = {"version": current_version}
+        await query.message.reply_text(
+            "Отправьте список согласующих (юзернеймы через пробел/запятую/новую строку), например:\n"
+            "@asdinamitif @FrolovAlNGSN @cappit_G59"
+        )
         return
+
+    # заглушки
+    if data == "schedule_upload":
+        await query.message.reply_text("Загрузка файла графика в этой версии не реализована.")
+        return
+
+    # === Обработка нажатий согласующих ===
+    if data.startswith("schedule_approve:") or data.startswith("schedule_rework:"):
+        parts = data.split(":", 1)
+        action = parts[0]  # schedule_approve / schedule_rework
+        approver_tag = parts[1]  # @user
+
+        user_username = user.username or ""
+        user_tag = f"@{user_username}" if user_username else ""
+
+        if user_tag.lower() != approver_tag.lower():
+            await query.answer(
+                text=f"Эта кнопка предназначена для {approver_tag}.",
+                show_alert=True,
+            )
+            return
+
+        if action == "schedule_approve":
+            update_schedule_approval_status(
+                current_version, approver_tag, "approved", None
+            )
+            await query.message.reply_text(
+                f"{approver_tag} согласовал(а) график. Спасибо!"
+            )
+            return
+
+        if action == "schedule_rework":
+            # требуется комментарий от этого пользователя
+            context.user_data["awaiting_rework_comment"] = {
+                "version": current_version,
+                "approver": approver_tag,
+            }
+            await query.message.reply_text(
+                "Напишите, пожалуйста, комментарий, почему график нужно доработать."
+            )
+            return
 
     # === Замечания → Не устранены ===
     if data == "remarks_not_done":
@@ -931,6 +1127,81 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
+    # === Ожидаем комментарий к "На доработку" ===
+    if context.user_data.get("awaiting_rework_comment"):
+        info = context.user_data.pop("awaiting_rework_comment")
+        version = info["version"]
+        approver = info["approver"]
+        comment = text
+        update_schedule_approval_status(version, approver, "rework", comment)
+        await update.message.reply_text(
+            "Комментарий сохранён. График помечен как отправленный на доработку."
+        )
+        return
+
+    # === Ожидаем ввод списка согласующих от администратора ===
+    if context.user_data.get("awaiting_approvers_input"):
+        info = context.user_data.pop("awaiting_approvers_input")
+        version = info["version"]
+
+        raw = text.replace(",", " ").split()
+        approvers: List[str] = []
+        for token in raw:
+            token = token.strip()
+            if not token:
+                continue
+            if not token.startswith("@"):
+                token = "@" + token
+            approvers.append(token)
+
+        approvers = list(dict.fromkeys(approvers))  # уникальные, порядок сохранён
+
+        if not approvers:
+            await update.message.reply_text(
+                "Не удалось найти ни одного юзернейма. Попробуйте ещё раз /start → 📅 График → 👥 Согласующие."
+            )
+            return
+
+        set_current_approvers_for_version(approvers, version)
+
+        # отправляем сообщение в чат согласования
+        settings = get_schedule_state()
+        notify_chat_id = get_schedule_notify_chat_id(settings) or update.effective_chat.id
+
+        lines = [
+            f"График на новую неделю, необходимо согласовать.",
+            f"Версия: {version}",
+            "",
+            "Согласующие:",
+        ]
+        for a in approvers:
+            lines.append(f"• {a}")
+        text_msg = "\n".join(lines)
+
+        # строим клавиатуру: по строке на каждого согласующего
+        buttons = []
+        for a in approvers:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"✅ Согласовать ({a})", callback_data=f"schedule_approve:{a}"
+                    ),
+                    InlineKeyboardButton(
+                        f"✏️ На доработку ({a})", callback_data=f"schedule_rework:{a}"
+                    ),
+                ]
+            )
+        kb = InlineKeyboardMarkup(buttons)
+
+        await context.bot.send_message(
+            chat_id=notify_chat_id,
+            text=text_msg,
+            reply_markup=kb,
+        )
+
+        await update.message.reply_text("Согласующие обновлены и уведомлены.")
+        return
+
     # === ОНзС: ввод номера дела ===
     if context.user_data.get("awaiting_onzs_case"):
         context.user_data["awaiting_onzs_case"] = False
@@ -948,7 +1219,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # === Основное меню ===
-    if text.lower() == "📅 график".lower():
+    low = text.lower()
+
+    if low == "📅 график".lower():
         settings = get_schedule_state()
         is_admin_flag = is_admin(update.effective_user.id)
         msg = build_schedule_text(is_admin_flag, settings)
@@ -956,27 +1229,69 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, reply_markup=kb)
         return
 
-    if text.lower() == "📊 итоговая".lower():
+    if low == "📊 итоговая".lower():
         await update.message.reply_text("Раздел «Итоговая» пока в упрощённом виде.")
         return
 
-    if text.lower() == "📝 замечания".lower():
+    if low == "📝 замечания".lower():
         kb = remarks_menu_inline()
         await update.message.reply_text("Раздел «Замечания»:", reply_markup=kb)
         return
 
-    if text.lower() == "🏗 онзс".lower():
+    if low == "🏗 онзс".lower():
         kb = onzs_menu_inline()
         await update.message.reply_text("Раздел «ОНзС»:", reply_markup=kb)
         return
 
-    if text.lower() == "инспектор":
+    if low == "инспектор":
         kb = inspector_menu_inline()
         await update.message.reply_text("Раздел «Инспектор»:", reply_markup=kb)
         return
 
-    if text.lower() == "📈 аналитика".lower():
-        await update.message.reply_text("Аналитика появится позже.")
+    if low == "📈 аналитика".lower():
+        # простая аналитика по согласованию графика
+        conn = get_db()
+        c = conn.cursor()
+        c.execute(
+            """SELECT version, approver, status, comment, decided_at, requested_at
+               FROM schedule_approvals
+               ORDER BY version DESC, approver"""
+        )
+        rows = c.fetchall()
+        conn.close()
+
+        if not rows:
+            await update.message.reply_text("Пока нет данных по согласованию графика.")
+            return
+
+        lines = ["📈 Аналитика по согласованию графика:", ""]
+        current_ver = None
+        for r in rows:
+            ver = r["version"]
+            if ver != current_ver:
+                current_ver = ver
+                lines.append(f"Версия {ver}:")
+            appr = r["approver"]
+            status = r["status"] or "pending"
+            decided = _format_dt(r["decided_at"])
+            requested = _format_dt(r["requested_at"])
+            comment = r["comment"] or ""
+
+            if status == "pending":
+                if requested:
+                    lines.append(f"• {appr} — ожидает, запрошено {requested}")
+                else:
+                    lines.append(f"• {appr} — ожидает согласования")
+            elif status == "approved":
+                lines.append(f"• {appr} — Согласовано {decided} ✅")
+            elif status == "rework":
+                if comment:
+                    lines.append(
+                        f"• {appr} — На доработку {decided} (Комментарий: {comment})"
+                    )
+                else:
+                    lines.append(f"• {appr} — На доработку {decided}")
+        await send_long_text(update.message.chat, "\n".join(lines))
         return
 
     await update.message.reply_text(
