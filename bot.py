@@ -17,6 +17,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InputFile,
 )
 from telegram.ext import (
     Application,
@@ -863,9 +864,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "schedule_download":
-        await query.message.reply_text(
-            "Файл графика можно открыть по ссылке:\n"
-            f"{GOOGLE_SHEET_URL_DEFAULT}"
+        df = get_schedule_df()
+        if df is None or df.empty:
+            await query.message.reply_text(
+                "Не удалось получить лист «График» для выгрузки."
+            )
+            return
+
+        buf = BytesIO()
+        # создаём отдельный xlsx только с одним листом «График»
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="График", index=False)
+        buf.seek(0)
+
+        filename = f"График_{local_now().date().isoformat()}.xlsx"
+        await query.message.reply_document(
+            document=InputFile(buf, filename=filename),
+            caption="Файл графика (только лист «График»).",
         )
         return
 
