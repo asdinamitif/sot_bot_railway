@@ -693,6 +693,35 @@ def build_onzs_text_for_case(df: pd.DataFrame, case_no: str) -> str:
     return f"ОНзС по делу {case_no}:\n" + "\n".join(f"• {v}" for v in values)
 
 
+# --------- отправка длинных сообщений (разбивка по 4000 символов) ---------
+
+
+async def send_long_text(chat, text: str, chunk_size: int = 4000):
+    """
+    Отправляет длинный текст несколькими сообщениями, чтобы не упереться
+    в лимит Telegram ~4096 символов.
+    """
+    if not text:
+        return
+
+    lines = text.split("\n")
+    buf = ""
+
+    for line in lines:
+        # +1 за перевод строки
+        if len(buf) + len(line) + 1 > chunk_size:
+            await chat.send_message(buf)
+            buf = line
+        else:
+            if buf:
+                buf += "\n" + line
+            else:
+                buf = line
+
+    if buf:
+        await chat.send_message(buf)
+
+
 # ----------------- Работа с пользователями и правами -----------------
 
 
@@ -938,7 +967,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
-        await query.message.reply_text(text)
+        # длинный текст режем на части
+        await send_long_text(query.message.chat, text)
         return
 
     if data == "remarks_download":
