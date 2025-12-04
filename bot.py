@@ -207,6 +207,24 @@ def get_col_by_letter(df: pd.DataFrame, letters: str) -> Optional[str]:
     return None
 
 
+def find_status_col(df: pd.DataFrame, include: List[str], exclude: Optional[List[str]] = None) -> Optional[str]:
+    """
+    Ищет колонку по словам в заголовке.
+    include – слова, которые ДОЛЖНЫ входить в название (в нижнем регистре),
+    exclude – слова, которые НЕ ДОЛЖНЫ входить.
+    """
+    if exclude is None:
+        exclude = []
+    include = [w.lower() for w in include]
+    exclude = [w.lower() for w in exclude]
+
+    for col in df.columns:
+        low = str(col).lower()
+        if all(w in low for w in include) and all(w not in low for w in exclude):
+            return col
+    return None
+
+
 # ----------------- Инспектор: запись в Google Sheets -----------------
 
 
@@ -592,59 +610,118 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
 
 def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     """
-    Строит текст по строкам, где Q/R/Y/AE == 'нет'
-    Группировка по номеру дела.
+    Строит текст по строкам, где В КАКОЙ-ЛИБО из 4 статусных колонок
+    стоит ровно «нет».
+
+    Для каждой строки/дела показываем:
+    • номер дела — Пожарная безопасность (Отметка об устранении замечаний ПБ да/нет); ...
+
+    Пустые ячейки, '-', 'н/д' и любые другие значения игнорируются.
     """
+
     df_copy = df.copy()
 
-    col_case = find_col(df_copy, ["дело", "номер дела", "номер_дела", "номер дела (номер объекта)"])
+    # --- колонка номера дела ---
+    col_case = find_col(
+        df_copy,
+        ["дело", "номер дела", "номер_дела", "номер дела (номер объекта)"],
+    )
     if not col_case:
         col_case = get_col_by_letter(df_copy, "I")
-
-    col_pb = get_col_by_letter(df_copy, "Q")
-    col_ar = get_col_by_letter(df_copy, "R")
-    col_mmr = get_col_by_letter(df_copy, "Y")
-    col_ago = get_col_by_letter(df_copy, "AE")
-
-    col_pb_cat = get_col_by_letter(df_copy, "K")
-    col_ar_cat = get_col_by_letter(df_copy, "L")
-    col_mmr_cat = get_col_by_letter(df_copy, "M")
-    col_ago_cat = get_col_by_letter(df_copy, "N")
-
-    col_pb = col_pb or (col_pb_cat if col_pb_cat in df_copy.columns else None)
-    col_ar = col_ar or (col_ar_cat if col_ar_cat in df_copy.columns else None)
-    col_mmr = col_mmr or (col_mmr_cat if col_mmr_cat in df_copy.columns else None)
-    col_ago = col_ago or (col_ago_cat if col_ago_cat in df_copy.columns else None)
 
     if not col_case:
         return "Не удалось определить колонку с номером дела (I)."
 
-    has_no = []
+    # --- статусные колонки: ищем по тексту заголовка ---
+    # 1) Отметка об устранении замечаний ПБ да/нет
+    col_pb = find_status_col(
+        df_copy,
+        include=["отметка", "устран", "пб", "да/нет"],
+        exclude=["зк", "кнд"],
+    )
+
+    # 2) Отметка об устранении замечаний ПБ в ЗК КНД да/нет
+    col_pb_zk = find_status_col(
+        df_copy,
+        include=["отметка", "устран", "пб", "зк", "кнд", "да/нет"],
+    )
+
+    # 3) Отметка об устранении нарушений АР, ММГН, АГО да/нет
+    col_ar = find_status_col(
+        df_copy,
+        include=["отметка", "устран", "ар", "ммгн", "аго", "да/нет"],
+    )
+
+    # 4) Отметка об устранении нарушений ЭОМ да/нет
+    col_eom = find_status_col(
+        df_copy,
+        include=["отметка", "устран", "эом", "да/нет"],
+    )
+
+    def is_net(row, col_name: Optional[str]) -> bool:
+        if not col_name:
+            return False
+        val = row.get(col_name, "")
+        if val is None:
+            return False
+        text = str(val).strip().lower()
+        if not text:
+            return False
+        if text in {"-", "н/д", "нет данных"}:
+            return False
+        return text == "нет"
+
+    has_no: List[tuple[str, List[str]]] = []
+
     for _, row in df_copy.iterrows():
         case_val = str(row.get(col_case, "")).strip()
         if not case_val:
             continue
 
-        blocks = []
+        blocks: List[str] = []
 
-        if col_pb and str(row.get(col_pb, "")).strip().lower() == "нет":
-            blocks.append("Пожарная безопасность")
+        # Пожарная безопасность – основная колонка
+        if is_net(row, col_pb):
+            blocks.append(
+                f"Пожарная безопасность ({col_pb})"
+                if col_pb
+                else "Пожарная безопасность"
+            )
 
-        if col_ar and str(row.get(col_ar, "")).strip().lower() == "нет":
-            blocks.append("Архитектура")
+        # Пожарная безопасность в ЗК КНД
+        if is_net(row, col_pb_zk):
+            blocks.append(
+                f"Пожарная безопасность в ЗК КНД ({col_pb_zk})"
+                if col_pb_zk
+                else "Пожарная безопасность в ЗК КНД"
+            )
 
-        if col_mmr and str(row.get(col_mmr, "")).strip().lower() == "нет":
-            blocks.append("ММГН")
+        # Архитектура / ММГН / АГО
+        if is_net(row, col_ar):
+            blocks.append(
+                f"Архитектура, ММГН, АГО ({col_ar})"
+                if col_ar
+                else "Архитектура, ММГН, АГО"
+            )
 
-        if col_ago and str(row.get(col_ago, "")).strip().lower() == "нет":
-            blocks.append("АГО")
+        # Электроснабжение (ЭОМ)
+        if is_net(row, col_eom):
+            blocks.append(
+                f"Электроснабжение (ЭОМ) ({col_eom})"
+                if col_eom
+                else "Электроснабжение (ЭОМ)"
+            )
 
-        if blocks:
-            has_no.append((case_val, blocks))
+        # Если в строке ни в одной колонке нет «нет» – пропускаем
+        if not blocks:
+            continue
+
+        has_no.append((case_val, blocks))
 
     if not has_no:
         return "Во всех строках статусы устранения не содержат «нет»."
 
+    # Группируем по делу, чтобы не было дублей
     grouped: Dict[str, List[str]] = {}
     for case_no, blocks in has_no:
         grouped.setdefault(case_no, [])
@@ -833,15 +910,12 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         if not records:
             await update.message.reply_text("Нет ближайших итоговых проверок в ближайшие 30 дней.")
-            return
-
-        records.sort(key=lambda x: x[0])
-
-        lines = ["Ближайшие итоговые проверки:"]
-        for d, ctype, case_no in records[:20]:
-            lines.append(f"• {d.strftime('%d.%m.%Y')} — {ctype} — дело: {case_no}")
-
-        await update.message.reply_text("\n".join(lines))
+        else:
+            records.sort(key=lambda x: x[0])
+            lines = ["Ближайшие итоговые проверки:"]
+            for d, ctype, case_no in records[:20]:
+                lines.append(f"• {d.strftime('%d.%m.%Y')} — {ctype} — дело: {case_no}")
+            await update.message.reply_text("\n".join(lines))
         return
 
     if text == "📝 замечания".lower():
@@ -1198,7 +1272,6 @@ def get_remarks_df() -> Optional[pd.DataFrame]:
     frames: List[pd.DataFrame] = []
 
     for sheet_name in xls.sheet_names:
-        # Никаких пропусков — берём все листы, включая ПБ, АР,ММГН, АГО (2025)
         try:
             df_sheet = pd.read_excel(xls, sheet_name=sheet_name)
         except Exception as e_sheet:
