@@ -482,12 +482,6 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
     approvers = get_current_approvers(settings)
     approvals = get_schedule_approvals(version)
 
-    lines = [f"📅 График выездов (версия {version})", ""]
-
-    if not approvers:
-        lines.append("Согласующие не назначены.")
-        return "\n".join(lines)
-
     pending = []
     approved = []
     rework = []
@@ -502,6 +496,36 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
             approved.append(r)
         elif r["status"] == "rework":
             rework.append(r)
+
+    # --- заголовок: либо период, либо "версия N" ---
+    header = None
+    if approved:
+        # дата последнего согласования
+        dt_list: List[datetime] = []
+        for r in approved:
+            try:
+                dt = datetime.fromisoformat(r["decided_at"])
+                dt_list.append(dt)
+            except Exception:
+                continue
+
+        if dt_list:
+            last_dt = max(dt_list)
+            start_date = last_dt.date()
+            end_date = (last_dt + timedelta(days=4)).date()
+            header = (
+                f"📅 График выездов с {start_date.strftime('%d.%m.%Y')} "
+                f"по {end_date.strftime('%d.%m.%Y')} г"
+            )
+
+    if not header:
+        header = f"📅 График выездов (версия {version})"
+
+    lines = [header, ""]
+
+    if not approvers:
+        lines.append("Согласующие не назначены.")
+        return "\n".join(lines)
 
     if rework:
         lines.append("Отправлено на доработку:")
