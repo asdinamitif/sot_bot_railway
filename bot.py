@@ -46,19 +46,39 @@ DB_PATH = os.getenv("DB_PATH", "sot_bot.db")
 TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "3"))
 ANALYTICS_PASSWORD = "051995"
 
-# Новая таблица (ID из ссылки, которую ты прислал)
-NEW_SHEET_ID = "1W_9Cs-LaX6KR4cE9xN71CliE6Lm_TyQqk8t3kQa4FCc"
 
-GOOGLE_SHEET_URL_DEFAULT = (
-    "https://docs.google.com/spreadsheets/d/"
-    f"{NEW_SHEET_ID}/edit?usp=sharing"
-)
+def _extract_spreadsheet_id_from_url(url: str) -> str:
+    try:
+        if "/d/" in url:
+            return url.split("/d/")[1].split("/")[0]
+    except Exception:
+        pass
+    return ""
 
-GSHEETS_SERVICE_ACCOUNT_JSON = os.getenv("GSHEETS_SERVICE_ACCOUNT_JSON", "").strip()
-GSHEETS_SPREADSHEET_ID = os.getenv(
-    "GSHEETS_SPREADSHEET_ID",
-    NEW_SHEET_ID,
-).strip()
+
+# URL основной Google-таблицы (где и график, и ПБ, АР,ММГН, АГО)
+SCHEDULE_URL_ENV = (os.getenv("SCHEDULE_URL") or "").strip()
+
+# ID таблицы: сначала берём из URL, если его нет — из переменной,
+# если и там пусто — используем новый ID по умолчанию.
+_default_sheet_id = _extract_spreadsheet_id_from_url(SCHEDULE_URL_ENV)
+if not _default_sheet_id:
+    _default_sheet_id = (os.getenv("GSHEETS_SPREADSHEET_ID") or "").strip()
+if not _default_sheet_id:
+    # Новый файл по умолчанию
+    _default_sheet_id = "1W_9Cs-LaX6KR4cE9xN71CliE6Lm_TyQqk8t3kQa4FCc"
+
+GSHEETS_SPREADSHEET_ID = _default_sheet_id
+
+# Красивая ссылка на эту таблицу
+if SCHEDULE_URL_ENV:
+    GOOGLE_SHEET_URL_DEFAULT = SCHEDULE_URL_ENV
+else:
+    GOOGLE_SHEET_URL_DEFAULT = (
+        f"https://docs.google.com/spreadsheets/d/{GSHEETS_SPREADSHEET_ID}/edit?usp=sharing"
+    )
+
+GSHEETS_SERVICE_ACCOUNT_JSON = (os.getenv("GSHEETS_SERVICE_ACCOUNT_JSON") or "").strip()
 
 SHEETS_SERVICE = None  # кеш клиента Google Sheets
 
@@ -79,7 +99,10 @@ RESPONSIBLE_USERNAMES: Dict[str, List[str]] = {
 INSPECTOR_SHEET_NAME = "ПБ, АР,ММГН, АГО (2025)"
 HARD_CODED_ADMINS = {398960707}  # Администраторы бота
 
-SCHEDULE_NOTIFY_CHAT_ID_ENV = os.getenv("SCHEDULE_NOTIFY_CHAT_ID", "").strip()
+SCHEDULE_NOTIFY_CHAT_ID_ENV = (os.getenv("SCHEDULE_NOTIFY_CHAT_ID") or "").strip()
+SCHEDULE_NOTIFY_CHAT_ID = (
+    int(SCHEDULE_NOTIFY_CHAT_ID_ENV) if SCHEDULE_NOTIFY_CHAT_ID_ENV else None
+)
 
 
 def is_admin(uid: int) -> bool:
@@ -109,7 +132,9 @@ def get_sheets_service():
         return SHEETS_SERVICE
 
     if not GSHEETS_SERVICE_ACCOUNT_JSON:
-        log.error("GSHEETS_SERVICE_ACCOUNT_JSON не задан – Google Sheets API недоступен.")
+        log.error(
+            "GSHEETS_SERVICE_ACCOUNT_JSON не задан – Google Sheets API недоступен."
+        )
         return None
 
     try:
@@ -153,10 +178,12 @@ def read_sheet_to_dataframe(
         return None
 
     try:
-        result = service.spreadsheets().values().get(
-            spreadsheetId=sheet_id,
-            range=f"'{sheet_name}'!A1:ZZZ1000",
-        ).execute()
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=sheet_id, range=f"'{sheet_name}'!A1:ZZZ1000")
+            .execute()
+        )
         values = result.get("values", [])
 
         if not values:
@@ -355,67 +382,11 @@ def update_schedule_approval_status(
     c.execute(
         """UPDATE schedule_approvals
            SET status=?, comment=?, decided_at=?
-         WHERE version=? AND approver=?""",
+           WHERE version=? AND approver=?""",
         (status, comment, now, version, approver),
     )
     conn.commit()
     conn.close()
-
-
-# -------------------------------------------------
-# Вспомогательные функции для периода графика
-# -------------------------------------------------
-def _parse_iso_date(iso_str: Optional[str]) -> Optional[date]:
-    if not iso_str:
-        return None
-    try:
-        return datetime.fromisoformat(iso_str).date()
-    except Exception:
-        return None
-
-
-def compute_schedule_period(version: int) -> Optional[tuple[date, date]]:
-    """
-    Пытаемся восстановить период графика по этой версии:
-    берём минимальную дату среди decided_at (approved),
-    если их нет — среди requested_at.
-    Конец периода = начало + 4 дня (итого 5 дней).
-    """
-    approvals = get_schedule_approvals(version)
-    if not approvals:
-        return None
-
-    dates: List[date] = []
-
-    # сначала смотрим только approved
-    for r in approvals:
-        if (r["status"] or "") == "approved":
-            d = _parse_iso_date(r["decided_at"])
-            if d:
-                dates.append(d)
-
-    # если нет approved, берём requested_at
-    if not dates:
-        for r in approvals:
-            d = _parse_iso_date(r["requested_at"])
-            if d:
-                dates.append(d)
-
-    if not dates:
-        return None
-
-    start = min(dates)
-    end = start + timedelta(days=4)
-    return start, end
-
-
-def format_schedule_title(version: int) -> str:
-    period = compute_schedule_period(version)
-    if period:
-        start, end = period
-        return f"📅 График выездов с {start:%d.%m.%Y} по {end:%d.%m.%Y} г"
-    else:
-        return f"📅 График выездов (версия {version})"
 
 
 # -------------------------------------------------
@@ -473,12 +444,13 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
     except Exception as e:
-        log.error("Ошибка скачивания Excel: %s", e)
+        log.error("Ошибка скачивания Excel (график): %s", e)
         return None
 
     try:
         xls = pd.ExcelFile(BytesIO(resp.content))
         if SHEET not in xls.sheet_names:
+            log.error("В файле нет листа '%s'", SHEET)
             return None
         df = pd.read_excel(xls, sheet_name=SHEET)
         df = df.dropna(how="all").reset_index(drop=True)
@@ -498,15 +470,44 @@ def _format_dt(iso_str: Optional[str]) -> str:
         dt = datetime.fromisoformat(iso_str)
         return dt.strftime("%d.%m.%Y %H:%M")
     except Exception:
-        return iso_str or ""
+        return iso_str
+
+
+def _compute_schedule_dates(approvals: List[sqlite3.Row]) -> (Optional[date], Optional[date]):
+    """
+    Берём дату последнего согласования и считаем диапазон +4 дня.
+    """
+    dates: List[date] = []
+    for r in approvals:
+        if r["status"] == "approved" and r["decided_at"]:
+            try:
+                dt = datetime.fromisoformat(r["decided_at"])
+                dates.append(dt.date())
+            except Exception:
+                pass
+    if not dates:
+        return None, None
+
+    base = max(dates)
+    d_from = base
+    d_to = base + timedelta(days=4)  # всего 5 календарных дней
+    return d_from, d_to
+
+
+def build_schedule_header(version: int, approvals: List[sqlite3.Row]) -> str:
+    d_from, d_to = _compute_schedule_dates(approvals)
+    if not d_from or not d_to:
+        return f"📅 График выездов (версия {version})"
+    return f"📅 График выездов с {d_from:%d.%m.%Y} по {d_to:%d.%m.%Y} г"
 
 
 def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
     version = get_schedule_version(settings)
-    approvers = get_current_approvers(settings)
     approvals = get_schedule_approvals(version)
+    approvers = get_current_approvers(settings)
 
-    lines = [format_schedule_title(version), ""]
+    header = build_schedule_header(version, approvals)
+    lines = [header, ""]
 
     if not approvers:
         lines.append("Согласующие не назначены.")
@@ -584,7 +585,7 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
             return False
         return text.startswith("нет")
 
-    grouped: Dict[str, Dict[str, set]] = {}
+    grouped = {}
 
     for _, row in df.iterrows():
         case = str(row.iloc[idx_case]).strip()
@@ -624,7 +625,7 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     ]
 
     for case, blocks in grouped.items():
-        parts: List[str] = []
+        parts = []
         if blocks["pb"]:
             parts.append(
                 "Пожарная безопасность: "
@@ -664,7 +665,7 @@ async def send_long_text(chat, text: str, chunk_size=3500):
 
 
 # -------------------------------------------------
-# Считывание листа с замечаниями
+# Считывание листа замечаний
 # -------------------------------------------------
 def get_remarks_df_current() -> Optional[pd.DataFrame]:
     sheet = get_current_remarks_sheet_name()
@@ -675,9 +676,11 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
         resp.raise_for_status()
         xls = pd.ExcelFile(BytesIO(resp.content))
         if sheet not in xls.sheet_names:
+            log.error("В файле нет листа '%s'", sheet)
             return None
         return pd.read_excel(xls, sheet_name=sheet)
-    except Exception:
+    except Exception as e:
+        log.error("Ошибка чтения листа замечаний: %s", e)
         return None
 
 
@@ -691,22 +694,22 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
         return False
 
     try:
-        d_value = (
+        D_value = (
             f"Площадь (кв.м): {form.get('area', '')}; "
             f"Количество этажей: {form.get('floors', '')}"
         )
 
         row = [
             "",  # A
-            form.get("date").strftime("%d.%m.%Y") if form.get("date") else "",  # B
+            form.get("date").strftime("%d.%m.%Y") if form.get("date") else "",  # B дата
             "",  # C
-            d_value,  # D — площадь + этажность
+            D_value,  # D объединённые площадь + этажи
             form.get("onzs", ""),  # E
             form.get("developer", ""),  # F
             form.get("object", ""),  # G
             form.get("address", ""),  # H
             form.get("case", ""),  # I
-            form.get("check_type", ""),  # J
+            form.get("check_type", ""),  # J вид проверки
         ]
 
         body = {"values": [row]}
@@ -788,7 +791,9 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "case":
         form["case"] = text
         form["step"] = "check_type"
-        await update.message.reply_text("Введите вид проверки (ПП, итоговая, профвизит):")
+        await update.message.reply_text(
+            "Введите вид проверки (ПП, итоговая, профвизит):"
+        )
         return
 
     if step == "check_type":
@@ -802,7 +807,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Выезд успешно записан в таблицу.")
         else:
             await update.message.reply_text(
-                "Ошибка записи в таблицу: Google Sheets API недоступен (нет ключа или ошибка инициализации)."
+                "Ошибка записи в таблицу: Google Sheets API недоступен (ключ или права)."
             )
 
         context.user_data["inspector_form"] = None
@@ -813,8 +818,8 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ОНзС — клавиатура и вывод по цифре 1–12
 # -------------------------------------------------
 def onzs_menu_inline() -> InlineKeyboardMarkup:
-    buttons: List[List[InlineKeyboardButton]] = []
-    row: List[InlineKeyboardButton] = []
+    buttons = []
+    row = []
     for i in range(1, 13):
         row.append(InlineKeyboardButton(str(i), callback_data=f"onzs_filter_{i}"))
         if len(row) == 4:
@@ -888,7 +893,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename = f"График_{local_now().date().isoformat()}.xlsx"
         await query.message.reply_document(
             document=InputFile(buf, filename=filename),
-            caption="Файл графика (только лист «График»).",
+            caption="Файл графика (лист «График»).",
         )
         return
 
@@ -928,36 +933,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{approver_tag} согласовал(а) график. Спасибо!"
             )
 
-            # после каждого утверждения проверяем, все ли согласовали
+            # Проверяем, все ли согласовали
             approvals = get_schedule_approvals(version)
-            statuses = [r["status"] or "pending" for r in approvals]
-            if statuses and all(s == "approved" for s in statuses):
-                # все согласовали — отправляем в канал, если настроен chat_id
-                settings = get_schedule_state()
-                notify_chat_id = settings.get("schedule_notify_chat_id") or ""
-                if notify_chat_id:
-                    title = format_schedule_title(version)
-                    body_lines = [title, "", "Согласовано всеми:"]
-                    for r in approvals:
-                        body_lines.append(
-                            f"• {r['approver']} — {_format_dt(r['decided_at'])} ✅"
-                        )
-                    text_to_send = "\n".join(body_lines)
+            if approvals and all(r["status"] == "approved" for r in approvals):
+                header = build_schedule_header(version, approvals)
+                lines = [header, "", "Согласовано всеми:"]
+                for r in approvals:
+                    lines.append(
+                        f"• {r['approver']} — {_format_dt(r['decided_at'])} ✅"
+                    )
+                text = "\n".join(lines)
+
+                # Отправляем в канал/группу, если указан chat_id
+                if SCHEDULE_NOTIFY_CHAT_ID is not None:
                     try:
                         await context.bot.send_message(
-                            chat_id=notify_chat_id, text=text_to_send
-                        )
-                        log.info(
-                            "Отправлен итоговый график в чат %s (версия %s)",
-                            notify_chat_id,
-                            version,
+                            chat_id=SCHEDULE_NOTIFY_CHAT_ID, text=text
                         )
                     except Exception as e:
                         log.error(
-                            "Не удалось отправить график в notify_chat_id=%s: %s",
-                            notify_chat_id,
+                            "Ошибка отправки графика в канал %s: %s",
+                            SCHEDULE_NOTIFY_CHAT_ID,
                             e,
                         )
+
             return
 
         if action == "schedule_rework":
@@ -985,7 +984,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "remarks_download":
         await query.message.reply_text(
-            "Файл замечаний можно открыть по ссылке:\n" f"{GOOGLE_SHEET_URL_DEFAULT}"
+            "Файл замечаний и графика можно открыть по ссылке:\n"
+            f"{GOOGLE_SHEET_URL_DEFAULT}"
         )
         return
 
@@ -1032,7 +1032,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         version = info["version"]
 
         raw = text.replace(",", " ").split()
-        approvers: List[str] = []
+        approvers = []
         for token in raw:
             token = token.strip()
             if not token:
@@ -1064,7 +1064,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"✅ Согласовать ({a})", callback_data=f"schedule_approve:{a}"
                     ),
                     InlineKeyboardButton(
-                        f"✏️ На доработку ({a})", callback_data=f"schedule_rework:{a}"
+                        f"✏️ На доработку ({a})",
+                        callback_data=f"schedule_rework:{a}",
                     ),
                 ]
                 for a in approvers
@@ -1125,33 +1126,36 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Пока нет данных по согласованию графика.")
             return
 
-        lines: List[str] = ["📈 Аналитика по согласованию графика:", ""]
-        cur_ver: Optional[int] = None
-
+        # группируем по версиям
+        by_ver: Dict[int, List[sqlite3.Row]] = {}
         for r in rows:
-            ver = r["version"]
-            if ver != cur_ver:
-                cur_ver = ver
-                title = format_schedule_title(ver)
-                lines.append(f"\n{title}")
+            by_ver.setdefault(r["version"], []).append(r)
 
-            appr = r["approver"]
-            status = r["status"] or "pending"
-            decided = _format_dt(r["decided_at"])
-            requested = _format_dt(r["requested_at"])
-            comment = r["comment"] or ""
+        lines: List[str] = ["📈 Аналитика по согласованию графика:", ""]
 
-            if status == "pending":
-                lines.append(f"• {appr} — ожидает, запрошено {requested}")
-            elif status == "approved":
-                lines.append(f"• {appr} — Согласовано {decided} ✅")
-            elif status == "rework":
-                if comment:
-                    lines.append(
-                        f"• {appr} — На доработку {decided} (Комментарий: {comment})"
-                    )
-                else:
-                    lines.append(f"• {appr} — На доработку {decided}")
+        for ver in sorted(by_ver.keys(), reverse=True):
+            approvals = by_ver[ver]
+            header = build_schedule_header(ver, approvals)
+            lines.append("")
+            lines.append(header + ":")
+            for r in approvals:
+                appr = r["approver"]
+                status = r["status"] or "pending"
+                decided = _format_dt(r["decided_at"])
+                requested = _format_dt(r["requested_at"])
+                comment = r["comment"] or ""
+
+                if status == "pending":
+                    lines.append(f"• {appr} — ожидает, запрошено {requested}")
+                elif status == "approved":
+                    lines.append(f"• {appr} — Согласовано {decided} ✅")
+                elif status == "rework":
+                    if comment:
+                        lines.append(
+                            f"• {appr} — На доработку {decided} (Комментарий: {comment})"
+                        )
+                    else:
+                        lines.append(f"• {appr} — На доработку {decided}")
 
         await send_long_text(chat, "\n".join(lines))
         return
@@ -1168,7 +1172,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------------------------------------
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Загрузка файлов отключена. Используйте Google Sheets."
+        "Загрузка файлов отключена. Используйте общую Google-таблицу."
     )
 
 
