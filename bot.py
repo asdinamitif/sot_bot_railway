@@ -1,7 +1,7 @@
 import logging
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from io import BytesIO
 from typing import Optional, Dict, Any, List
 
@@ -46,15 +46,18 @@ DB_PATH = os.getenv("DB_PATH", "sot_bot.db")
 TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "3"))
 ANALYTICS_PASSWORD = "051995"
 
+# Новая таблица (ID из ссылки, которую ты прислал)
+NEW_SHEET_ID = "1W_9Cs-LaX6KR4cE9xN71CliE6Lm_TyQqk8t3kQa4FCc"
+
 GOOGLE_SHEET_URL_DEFAULT = (
     "https://docs.google.com/spreadsheets/d/"
-    "1FlhN7grvku5tSj2SAreEHxHC55K9E7N91r8eWOkzOFY/edit?usp=sharing"
+    f"{NEW_SHEET_ID}/edit?usp=sharing"
 )
 
 GSHEETS_SERVICE_ACCOUNT_JSON = os.getenv("GSHEETS_SERVICE_ACCOUNT_JSON", "").strip()
 GSHEETS_SPREADSHEET_ID = os.getenv(
     "GSHEETS_SPREADSHEET_ID",
-    "1FlhN7grvku5tSj2SAreEHxHC55K9E7N91r8eWOkzOFY",
+    NEW_SHEET_ID,
 ).strip()
 
 SHEETS_SERVICE = None  # кеш клиента Google Sheets
@@ -74,7 +77,7 @@ RESPONSIBLE_USERNAMES: Dict[str, List[str]] = {
 }
 
 INSPECTOR_SHEET_NAME = "ПБ, АР,ММГН, АГО (2025)"
-HARD_CODED_ADMINS = {398960707}   # Администраторы бота
+HARD_CODED_ADMINS = {398960707}  # Администраторы бота
 
 SCHEDULE_NOTIFY_CHAT_ID_ENV = os.getenv("SCHEDULE_NOTIFY_CHAT_ID", "").strip()
 
@@ -292,7 +295,7 @@ def get_schedule_state() -> dict:
 def get_schedule_version(settings: dict) -> int:
     try:
         return int(settings.get("schedule_version") or "1")
-    except:
+    except Exception:
         return 1
 
 
@@ -360,6 +363,62 @@ def update_schedule_approval_status(
 
 
 # -------------------------------------------------
+# Вспомогательные функции для периода графика
+# -------------------------------------------------
+def _parse_iso_date(iso_str: Optional[str]) -> Optional[date]:
+    if not iso_str:
+        return None
+    try:
+        return datetime.fromisoformat(iso_str).date()
+    except Exception:
+        return None
+
+
+def compute_schedule_period(version: int) -> Optional[tuple[date, date]]:
+    """
+    Пытаемся восстановить период графика по этой версии:
+    берём минимальную дату среди decided_at (approved),
+    если их нет — среди requested_at.
+    Конец периода = начало + 4 дня (итого 5 дней).
+    """
+    approvals = get_schedule_approvals(version)
+    if not approvals:
+        return None
+
+    dates: List[date] = []
+
+    # сначала смотрим только approved
+    for r in approvals:
+        if (r["status"] or "") == "approved":
+            d = _parse_iso_date(r["decided_at"])
+            if d:
+                dates.append(d)
+
+    # если нет approved, берём requested_at
+    if not dates:
+        for r in approvals:
+            d = _parse_iso_date(r["requested_at"])
+            if d:
+                dates.append(d)
+
+    if not dates:
+        return None
+
+    start = min(dates)
+    end = start + timedelta(days=4)
+    return start, end
+
+
+def format_schedule_title(version: int) -> str:
+    period = compute_schedule_period(version)
+    if period:
+        start, end = period
+        return f"📅 График выездов с {start:%d.%m.%Y} по {end:%d.%m.%Y} г"
+    else:
+        return f"📅 График выездов (версия {version})"
+
+
+# -------------------------------------------------
 # Клавиатуры
 # -------------------------------------------------
 def main_menu() -> ReplyKeyboardMarkup:
@@ -373,53 +432,18 @@ def main_menu() -> ReplyKeyboardMarkup:
     )
 
 
-def build_schedule_inline(
-    is_admin_flag: bool,
-    settings: dict,
-    user_tag: Optional[str] = None,
-) -> InlineKeyboardMarkup:
-    """
-    Клавиатура под карточкой «📅 График».
-
-    - Всегда: Обновить / Скачать / Загрузить
-    - Для админа: кнопка «Согласующие»
-    - Для согласующего с pending-статусом: «✅ Согласовать / ✏️ На доработку»
-    """
-    buttons: List[List[InlineKeyboardButton]] = [
+def build_schedule_inline(is_admin_flag: bool, settings: dict):
+    buttons = [
         [
             InlineKeyboardButton("🔄 Обновить", callback_data="schedule_refresh"),
             InlineKeyboardButton("📥 Скачать", callback_data="schedule_download"),
         ],
         [InlineKeyboardButton("📤 Загрузить", callback_data="schedule_upload")],
     ]
-
-    version = get_schedule_version(settings)
-
     if is_admin_flag:
         buttons.append(
             [InlineKeyboardButton("👥 Согласующие", callback_data="schedule_approvers")]
         )
-
-    # Персональные кнопки для согласующего
-    if user_tag:
-        approvers = get_current_approvers(settings)
-        if user_tag in approvers:
-            approvals = get_schedule_approvals(version)
-            by_approver = {r["approver"]: r for r in approvals}
-            r = by_approver.get(user_tag)
-            status = (r["status"] if r else None) or "pending"
-            if status == "pending":
-                buttons.append(
-                    [
-                        InlineKeyboardButton(
-                            "✅ Согласовать", callback_data=f"schedule_approve:{user_tag}"
-                        ),
-                        InlineKeyboardButton(
-                            "✏️ На доработку", callback_data=f"schedule_rework:{user_tag}"
-                        ),
-                    ]
-                )
-
     return InlineKeyboardMarkup(buttons)
 
 
@@ -473,8 +497,8 @@ def _format_dt(iso_str: Optional[str]) -> str:
     try:
         dt = datetime.fromisoformat(iso_str)
         return dt.strftime("%d.%m.%Y %H:%M")
-    except:
-        return iso_str
+    except Exception:
+        return iso_str or ""
 
 
 def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
@@ -482,9 +506,15 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
     approvers = get_current_approvers(settings)
     approvals = get_schedule_approvals(version)
 
-    pending = []
-    approved = []
-    rework = []
+    lines = [format_schedule_title(version), ""]
+
+    if not approvers:
+        lines.append("Согласующие не назначены.")
+        return "\n".join(lines)
+
+    pending: List[str] = []
+    approved: List[sqlite3.Row] = []
+    rework: List[sqlite3.Row] = []
 
     by_approver = {r["approver"]: r for r in approvals}
 
@@ -496,36 +526,6 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
             approved.append(r)
         elif r["status"] == "rework":
             rework.append(r)
-
-    # --- заголовок: либо период, либо "версия N" ---
-    header = None
-    if approved:
-        # дата последнего согласования
-        dt_list: List[datetime] = []
-        for r in approved:
-            try:
-                dt = datetime.fromisoformat(r["decided_at"])
-                dt_list.append(dt)
-            except Exception:
-                continue
-
-        if dt_list:
-            last_dt = max(dt_list)
-            start_date = last_dt.date()
-            end_date = (last_dt + timedelta(days=4)).date()
-            header = (
-                f"📅 График выездов с {start_date.strftime('%d.%m.%Y')} "
-                f"по {end_date.strftime('%d.%m.%Y')} г"
-            )
-
-    if not header:
-        header = f"📅 График выездов (версия {version})"
-
-    lines = [header, ""]
-
-    if not approvers:
-        lines.append("Согласующие не назначены.")
-        return "\n".join(lines)
 
     if rework:
         lines.append("Отправлено на доработку:")
@@ -584,7 +584,7 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
             return False
         return text.startswith("нет")
 
-    grouped = {}
+    grouped: Dict[str, Dict[str, set]] = {}
 
     for _, row in df.iterrows():
         case = str(row.iloc[idx_case]).strip()
@@ -624,7 +624,7 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     ]
 
     for case, blocks in grouped.items():
-        parts = []
+        parts: List[str] = []
         if blocks["pb"]:
             parts.append(
                 "Пожарная безопасность: "
@@ -632,7 +632,8 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
             )
         if blocks["ar"]:
             parts.append(
-                "Архитектура, ММГН, АГО: " + ", ".join(b + " - нет" for b in blocks["ar"])
+                "Архитектура, ММГН, АГО: "
+                + ", ".join(b + " - нет" for b in blocks["ar"])
             )
         if blocks["eom"]:
             parts.append(
@@ -663,7 +664,7 @@ async def send_long_text(chat, text: str, chunk_size=3500):
 
 
 # -------------------------------------------------
-# Считывание листа замечаний (текущий год)
+# Считывание листа с замечаниями
 # -------------------------------------------------
 def get_remarks_df_current() -> Optional[pd.DataFrame]:
     sheet = get_current_remarks_sheet_name()
@@ -676,8 +677,7 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
         if sheet not in xls.sheet_names:
             return None
         return pd.read_excel(xls, sheet_name=sheet)
-    except Exception as e:
-        log.error("Ошибка чтения листа замечаний: %s", e)
+    except Exception:
         return None
 
 
@@ -687,13 +687,11 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
 def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
     service = get_sheets_service()
     if service is None:
-        log.error(
-            "Google Sheets API недоступен (нет ключа или ошибка инициализации)."
-        )
+        log.error("Google Sheets API недоступен.")
         return False
 
     try:
-        D_value = (
+        d_value = (
             f"Площадь (кв.м): {form.get('area', '')}; "
             f"Количество этажей: {form.get('floors', '')}"
         )
@@ -702,7 +700,7 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
             "",  # A
             form.get("date").strftime("%d.%m.%Y") if form.get("date") else "",  # B
             "",  # C
-            D_value,  # D
+            d_value,  # D — площадь + этажность
             form.get("onzs", ""),  # E
             form.get("developer", ""),  # F
             form.get("object", ""),  # G
@@ -747,7 +745,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
             form["date"] = datetime.strptime(text, "%d.%m.%Y").date()
             form["step"] = "area"
             await update.message.reply_text("Площадь (кв.м):")
-        except:
+        except Exception:
             await update.message.reply_text("Введите дату в формате ДД.ММ.ГГГГ")
         return
 
@@ -790,9 +788,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "case":
         form["case"] = text
         form["step"] = "check_type"
-        await update.message.reply_text(
-            "Введите вид проверки (ПП, итоговая, профвизит):"
-        )
+        await update.message.reply_text("Введите вид проверки (ПП, итоговая, профвизит):")
         return
 
     if step == "check_type":
@@ -806,8 +802,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Выезд успешно записан в таблицу.")
         else:
             await update.message.reply_text(
-                "Ошибка записи в таблицу: Google Sheets API недоступен "
-                "(нет ключа или ошибка инициализации)."
+                "Ошибка записи в таблицу: Google Sheets API недоступен (нет ключа или ошибка инициализации)."
             )
 
         context.user_data["inspector_form"] = None
@@ -831,9 +826,9 @@ def onzs_menu_inline() -> InlineKeyboardMarkup:
 
 
 def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
-    col_case = get_col_by_letter(df, "I")   # Номер дела
-    col_onzs = get_col_by_letter(df, "E")   # ОНзС
-    col_addr = get_col_by_letter(df, "H")   # Адрес
+    col_case = get_col_by_letter(df, "I")  # Номер дела
+    col_onzs = get_col_by_letter(df, "E")  # ОНзС
+    col_addr = get_col_by_letter(df, "H")  # Адрес
 
     if not col_case or not col_onzs:
         return "Не удалось определить структуру файла."
@@ -874,9 +869,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if df is None:
             await query.message.reply_text("Не удалось прочитать лист «График».")
         else:
-            await query.message.reply_text(
-                f"Лист «График» прочитан, строк: {len(df)}."
-            )
+            await query.message.reply_text(f"Лист «График» прочитан, строк: {len(df)}.")
         return
 
     if data == "schedule_download":
@@ -900,9 +893,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "schedule_upload":
-        await query.message.reply_text(
-            "Загрузка графика в этой сборке не реализована."
-        )
+        await query.message.reply_text("Загрузка графика в этой сборке не реализована.")
         return
 
     if data == "schedule_approvers":
@@ -936,6 +927,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(
                 f"{approver_tag} согласовал(а) график. Спасибо!"
             )
+
+            # после каждого утверждения проверяем, все ли согласовали
+            approvals = get_schedule_approvals(version)
+            statuses = [r["status"] or "pending" for r in approvals]
+            if statuses and all(s == "approved" for s in statuses):
+                # все согласовали — отправляем в канал, если настроен chat_id
+                settings = get_schedule_state()
+                notify_chat_id = settings.get("schedule_notify_chat_id") or ""
+                if notify_chat_id:
+                    title = format_schedule_title(version)
+                    body_lines = [title, "", "Согласовано всеми:"]
+                    for r in approvals:
+                        body_lines.append(
+                            f"• {r['approver']} — {_format_dt(r['decided_at'])} ✅"
+                        )
+                    text_to_send = "\n".join(body_lines)
+                    try:
+                        await context.bot.send_message(
+                            chat_id=notify_chat_id, text=text_to_send
+                        )
+                        log.info(
+                            "Отправлен итоговый график в чат %s (версия %s)",
+                            notify_chat_id,
+                            version,
+                        )
+                    except Exception as e:
+                        log.error(
+                            "Не удалось отправить график в notify_chat_id=%s: %s",
+                            notify_chat_id,
+                            e,
+                        )
             return
 
         if action == "schedule_rework":
@@ -963,8 +985,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "remarks_download":
         await query.message.reply_text(
-            "Файл замечаний можно открыть по ссылке:\n"
-            f"{GOOGLE_SHEET_URL_DEFAULT}"
+            "Файл замечаний можно открыть по ссылке:\n" f"{GOOGLE_SHEET_URL_DEFAULT}"
         )
         return
 
@@ -1066,11 +1087,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settings = get_schedule_state()
         is_adm = is_admin(update.effective_user.id)
         msg = build_schedule_text(is_adm, settings)
-
-        user_username = update.effective_user.username or ""
-        user_tag = f"@{user_username}" if user_username else ""
-
-        kb = build_schedule_inline(is_adm, settings, user_tag)
+        kb = build_schedule_inline(is_adm, settings)
         await update.message.reply_text(msg, reply_markup=kb)
         return
 
@@ -1108,14 +1125,15 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Пока нет данных по согласованию графика.")
             return
 
-        lines = ["📈 Аналитика по согласованию графика:", ""]
-        cur_ver = None
+        lines: List[str] = ["📈 Аналитика по согласованию графика:", ""]
+        cur_ver: Optional[int] = None
 
         for r in rows:
             ver = r["version"]
             if ver != cur_ver:
                 cur_ver = ver
-                lines.append(f"\nВерсия {ver}:")
+                title = format_schedule_title(ver)
+                lines.append(f"\n{title}")
 
             appr = r["approver"]
             status = r["status"] or "pending"
@@ -1159,7 +1177,8 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Добро пожаловать в бота отдела СОТ.", reply_markup=main_menu()
+        "Добро пожаловать в бота отдела СОТ.",
+        reply_markup=main_menu(),
     )
 
 
