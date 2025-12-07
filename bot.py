@@ -612,6 +612,47 @@ def build_schedule_header(version: int, approvals: List[sqlite3.Row]) -> str:
     return f"📅 График выездов с {d_from:%d.%m.%Y} по {d_to:%d.%m.%Y} г"
 
 
+def write_schedule_summary_to_sheet(version: int, approvals: List[sqlite3.Row]) -> None:
+    """
+    Дописывает в самый низ листа 'График' итог согласования:
+    - заголовок с датами (build_schedule_header)
+    - строку 'Согласовано всеми:'
+    - список согласовавших с датами
+    """
+    service = get_sheets_service()
+    if service is None:
+        log.error(
+            "Google Sheets сервис недоступен – не могу записать итог согласования в 'График'."
+        )
+        return
+
+    sheet_name = "График"
+
+    header = build_schedule_header(version, approvals)
+    rows = [
+        [""],  # пустая строка-разделитель
+        [header],
+        ["Согласовано всеми:"],
+    ]
+    for r in approvals:
+        line = f"{r['approver']} — {_format_dt(r['decided_at'])} ✅"
+        rows.append([line])
+
+    body = {"values": rows}
+
+    try:
+        service.spreadsheets().values().append(
+            spreadsheetId=GSHEETS_SPREADSHEET_ID,
+            range=f"'{sheet_name}'!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        ).execute()
+        log.info("Итог согласования версии %s дописан в лист '%s'.", version, sheet_name)
+    except Exception as e:
+        log.error("Ошибка записи итога согласования в лист '%s': %s", sheet_name, e)
+
+
 def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
     version = get_schedule_version(settings)
     approvals = get_schedule_approvals(version)
@@ -1051,7 +1092,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 text = "\n".join(lines)
 
-                # Отправляем в канал/группу, если указан chat_id
+                # 1) Пишем итог в самый низ листа "График"
+                write_schedule_summary_to_sheet(version, approvals)
+
+                # 2) Отправляем в канал/группу, если указан chat_id
                 if SCHEDULE_NOTIFY_CHAT_ID is not None:
                     try:
                         await context.bot.send_message(
