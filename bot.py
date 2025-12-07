@@ -215,7 +215,7 @@ def get_col_by_letter(df: pd.DataFrame, letters: str) -> Optional[str]:
 
 
 # -------------------------------------------------
-# БАЗА ДАННЫХ (график + согласование)
+# БАЗА ДАННЫХ (график + согласование + инспектор)
 # -------------------------------------------------
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -258,6 +258,23 @@ def init_db() -> None:
                comment TEXT,
                decided_at TEXT,
                requested_at TEXT
+           )"""
+    )
+
+    # НОВАЯ ТАБЛИЦА ДЛЯ "ИНСПЕКТОР"
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS inspector_visits (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               date TEXT,
+               area TEXT,
+               floors TEXT,
+               onzs TEXT,
+               developer TEXT,
+               object TEXT,
+               address TEXT,
+               case_no TEXT,
+               check_type TEXT,
+               created_at TEXT
            )"""
     )
 
@@ -369,6 +386,58 @@ def update_schedule_approval_status(
 
 
 # -------------------------------------------------
+# Инспектор: работа с БД
+# -------------------------------------------------
+def save_inspector_to_db(form: Dict[str, Any]) -> bool:
+    """
+    Сохраняет выезд в локную таблицу inspector_visits.
+    """
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        date_obj = form.get("date")
+        date_str = date_obj.strftime("%Y-%m-%d") if date_obj else None
+        c.execute(
+            """INSERT INTO inspector_visits
+               (date, area, floors, onzs, developer, object, address,
+                case_no, check_type, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                date_str,
+                form.get("area", ""),
+                form.get("floors", ""),
+                form.get("onzs", ""),
+                form.get("developer", ""),
+                form.get("object", ""),
+                form.get("address", ""),
+                form.get("case", ""),
+                form.get("check_type", ""),
+                local_now().isoformat(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        log.error("Ошибка сохранения инспектора в локную БД: %s", e)
+        return False
+
+
+def fetch_inspector_visits(limit: int = 50) -> List[sqlite3.Row]:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        """SELECT * FROM inspector_visits
+           ORDER BY date DESC, id DESC
+           LIMIT ?""",
+        (limit,),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+# -------------------------------------------------
 # Клавиатуры
 # -------------------------------------------------
 def main_menu() -> ReplyKeyboardMarkup:
@@ -408,7 +477,17 @@ def remarks_menu_inline() -> InlineKeyboardMarkup:
 
 def inspector_menu_inline() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("➕ Добавить выезд", callback_data="inspector_add")]]
+        [
+            [InlineKeyboardButton("➕ Добавить выезд", callback_data="inspector_add")],
+            [
+                InlineKeyboardButton(
+                    "📋 Список выездов", callback_data="inspector_list"
+                ),
+                InlineKeyboardButton(
+                    "📥 Скачать Excel", callback_data="inspector_download"
+                ),
+            ],
+        ]
     )
 
 
@@ -468,7 +547,6 @@ async def send_schedule_xlsx(
 
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        # данные с 3-й строки (A3) — место для шапки над ними
         df.to_excel(
             writer,
             sheet_name="График выездов",
@@ -480,7 +558,6 @@ async def send_schedule_xlsx(
         wb = writer.book
         ws = writer.sheets["График выездов"]
 
-        # === Заголовки ===
         headers = ["№ п/п"] + list(dataframe.columns)
         for col_num, value in enumerate(headers, 1):
             cell = ws.cell(row=2, column=col_num, value=value)
@@ -488,7 +565,6 @@ async def send_schedule_xlsx(
             cell.font = HEADER_FONT
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        # === Автоширина ===
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -532,12 +608,11 @@ async def send_schedule_xlsx(
         )
         ws.add_table(tab)
 
-        # ----- красивый блок согласования внизу -----
+        # красивый блок согласования
         if approvals:
             last_data_row = len(df) + 2
-            summary_start = last_data_row + 2  # отступ пустой строкой
+            summary_start = last_data_row + 2
 
-            # 1) Заголовок с периодом
             header_text = build_schedule_header(version, approvals)
             ws.merge_cells(f"A{summary_start}:{last_col_letter}{summary_start}")
             cell_header = ws[f"A{summary_start}"]
@@ -550,7 +625,6 @@ async def send_schedule_xlsx(
                 horizontal="center", vertical="center"
             )
 
-            # 2) "Согласовано всеми:"
             sub_row = summary_start + 1
             ws.merge_cells(f"A{sub_row}:{last_col_letter}{sub_row}")
             cell_sub = ws[f"A{sub_row}"]
@@ -560,7 +634,6 @@ async def send_schedule_xlsx(
                 horizontal="left", vertical="center"
             )
 
-            # 3) список согласовавших
             row_ptr = sub_row + 1
             approved_rows = [r for r in approvals if r["status"] == "approved"]
             others = [r for r in approvals if r["status"] != "approved"]
@@ -605,7 +678,7 @@ async def send_schedule_xlsx(
 
 
 # -------------------------------------------------
-# Текст графика со статусами
+# Текст графика
 # -------------------------------------------------
 def _format_dt(iso_str: Optional[str]) -> str:
     if not iso_str:
@@ -867,6 +940,10 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
 # Функция записи инспектора в Google Sheets
 # -------------------------------------------------
 def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
+    """
+    Пробуем записать выезд в общий файл Google Sheets.
+    Если не получится — возвращаем False, но локно всё равно сохраняем.
+    """
     service = get_sheets_service()
     if service is None:
         log.error("Google Sheets API недоступен.")
@@ -906,7 +983,7 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
             .execute()
         )
 
-        log.info("Инспектор: запись добавлена: %s", response)
+        log.info("Инспектор: запись добавлена в Google Sheets: %s", response)
         return True
 
     except Exception as e:
@@ -924,7 +1001,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if step == "date":
         try:
-            form["date"] = datetime.strptime(text, "%d.%m.%Y").date()
+            form["date"] = datetime.strptime(text, "%d.%м.%Y").date()
             form["step"] = "area"
             await update.message.reply_text("Площадь (кв.м):")
         except Exception:
@@ -964,14 +1041,14 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "address":
         form["address"] = text
         form["step"] = "case"
-        await update.message.reply_text("Номер дела:")
+        await update.message.reply_text("Номер дела (00-00-000000):")
         return
 
     if step == "case":
         form["case"] = text
         form["step"] = "check_type"
         await update.message.reply_text(
-            "Введите вид проверки (ПП, итоговая, профвизит):"
+            "Введите вид проверки (ПП, итоговая, профвизит и т.п.):"
         )
         return
 
@@ -979,16 +1056,29 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
         form["check_type"] = text
         form["step"] = "done"
 
-        await update.message.reply_text("Записываю в Google Sheets...")
+        await update.message.reply_text("Сохраняю выезд...")
 
-        ok = append_inspector_row_to_excel(form)
-        if ok:
-            await update.message.reply_text("Выезд успешно записан в таблицу.")
+        ok_db = save_inspector_to_db(form)
+        ok_gs = append_inspector_row_to_excel(form)
+
+        if ok_db and ok_gs:
+            msg = "Выезд сохранён в боте и добавлен в общую таблицу."
+        elif ok_db and not ok_gs:
+            msg = (
+                "Выезд сохранён в боте. В Google Sheets добавить не удалось "
+                "(проверьте ключ/права)."
+            )
+        elif not ok_db and ok_gs:
+            msg = (
+                "Выезд добавлен в Google Sheets, но не удалось сохранить локную запись."
+            )
         else:
-            await update.message.reply_text(
-                "Ошибка записи в таблицу: Google Sheets API недоступен (ключ или права)."
+            msg = (
+                "Не удалось сохранить выезд ни локно, ни в Google Sheets. "
+                "Сообщите разработчику."
             )
 
+        await update.message.reply_text(msg)
         context.user_data["inspector_form"] = None
         return
 
@@ -1033,6 +1123,83 @@ def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
             lines.append(f"• {case_no}")
 
     return "\n".join(lines)
+
+
+# -------------------------------------------------
+# Инспектор — просмотр и Excel
+# -------------------------------------------------
+def build_inspector_list_text(rows: List[sqlite3.Row]) -> str:
+    if not rows:
+        return "Пока нет сохранённых выездов инспектора."
+
+    lines: List[str] = ["Последние выезды инспектора:", ""]
+    for r in rows:
+        d = r["date"] or ""
+        try:
+            d_fmt = datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y")
+        except Exception:
+            d_fmt = d
+        lines.append(
+            f"• {d_fmt} — дело {r['case_no'] or '-'}, "
+            f"ОНзС {r['onzs'] or '-'}, {r['check_type'] or ''}"
+        )
+        addr = r["address"] or ""
+        if addr:
+            lines.append(f"  Адрес: {addr}")
+        obj = r["object"] or ""
+        if obj:
+            lines.append(f"  Объект: {obj}")
+        dev = r["developer"] or ""
+        if dev:
+            lines.append(f"  Застройщик: {dev}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+async def send_inspector_xlsx(
+    chat_id: int, rows: List[sqlite3.Row], context: ContextTypes.DEFAULT_TYPE
+):
+    if not rows:
+        await context.bot.send_message(
+            chat_id=chat_id, text="Пока нет сохранённых выездов инспектора."
+        )
+        return
+
+    data = []
+    for r in rows:
+        d = r["date"] or ""
+        try:
+            d_fmt = datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y")
+        except Exception:
+            d_fmt = d
+        data.append(
+            {
+                "Дата выезда": d_fmt,
+                "Площадь (кв.м)": r["area"] or "",
+                "Этажность": r["floors"] or "",
+                "ОНзС": r["onzs"] or "",
+                "Застройщик": r["developer"] or "",
+                "Наименование объекта": r["object"] or "",
+                "Строительный адрес": r["address"] or "",
+                "Номер дела": r["case_no"] or "",
+                "Вид проверки": r["check_type"] or "",
+            }
+        )
+
+    df = pd.DataFrame(data)
+
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Инспектор", index=False)
+
+    bio.seek(0)
+    filename = f"Инспектор_выезды_{date.today().strftime('%d.%m.%Y')}.xlsx"
+
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(bio, filename=filename),
+        caption="Выезды инспектора (отдельный файл)",
+    )
 
 
 # -------------------------------------------------
@@ -1177,6 +1344,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "inspector_add":
         context.user_data["inspector_form"] = {"step": "date"}
         await query.message.reply_text("Дата выезда (ДД.ММ.ГГГГ):")
+        return
+
+    if data == "inspector_list":
+        rows = fetch_inspector_visits(limit=50)
+        text = build_inspector_list_text(rows)
+        await send_long_text(query.message.chat, text)
+        return
+
+    if data == "inspector_download":
+        rows = fetch_inspector_visits(limit=1000)
+        await send_inspector_xlsx(
+            chat_id=query.message.chat.id, rows=rows, context=context
+        )
         return
 
 
