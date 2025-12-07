@@ -28,7 +28,6 @@ from telegram.ext import (
     filters,
 )
 
-# ДОБАВЛЕНО: стили для красивого Excel
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
@@ -63,18 +62,16 @@ def _extract_spreadsheet_id_from_url(url: str) -> str:
 # URL основной Google-таблицы (где и график, и ПБ, АР,ММГН, АГО)
 SCHEDULE_URL_ENV = (os.getenv("SCHEDULE_URL") or "").strip()
 
-# ID таблицы: сначала берём из URL, если его нет — из переменной,
-# если и там пусто — используем новый ID по умолчанию.
+# ID таблицы
 _default_sheet_id = _extract_spreadsheet_id_from_url(SCHEDULE_URL_ENV)
 if not _default_sheet_id:
     _default_sheet_id = (os.getenv("GSHEETS_SPREADSHEET_ID") or "").strip()
 if not _default_sheet_id:
-    # Новый файл по умолчанию
     _default_sheet_id = "1W_9Cs-LaX6KR4cE9xN71CliE6Lm_TyQqk8t3kQa4FCc"
 
 GSHEETS_SPREADSHEET_ID = _default_sheet_id
 
-# Красивая ссылка на эту таблицу
+# Красивая ссылка на таблицу
 if SCHEDULE_URL_ENV:
     GOOGLE_SHEET_URL_DEFAULT = SCHEDULE_URL_ENV
 else:
@@ -101,7 +98,7 @@ RESPONSIBLE_USERNAMES: Dict[str, List[str]] = {
 }
 
 INSPECTOR_SHEET_NAME = "ПБ, АР,ММГН, АГО (2025)"
-HARD_CODED_ADMINS = {398960707}  # Администраторы бота
+HARD_CODED_ADMINS = {398960707}
 
 SCHEDULE_NOTIFY_CHAT_ID_ENV = (os.getenv("SCHEDULE_NOTIFY_CHAT_ID") or "").strip()
 SCHEDULE_NOTIFY_CHAT_ID = (
@@ -126,10 +123,6 @@ def get_current_remarks_sheet_name() -> str:
 # Google Sheets helpers
 # -------------------------------------------------
 def get_sheets_service():
-    """
-    Возвращает объект сервиса Google Sheets (кешируется в SHEETS_SERVICE).
-    Используется для графика и записи инспектора.
-    """
     global SHEETS_SERVICE
 
     if SHEETS_SERVICE is not None:
@@ -156,12 +149,10 @@ def get_sheets_service():
 
 
 def build_export_url(spreadsheet_id: str) -> str:
-    """Ссылка на экспорт Google Sheets в .xlsx по ID таблицы."""
     return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=xlsx"
 
 
 def detect_header_row(values: List[List[str]]) -> int:
-    """Пытается найти строку заголовков по наличию 'дата выезда'."""
     for i, row in enumerate(values[:30]):
         row_lower = [str(c).lower() for c in row]
         if any("дата выезда" in c for c in row_lower):
@@ -172,10 +163,6 @@ def detect_header_row(values: List[List[str]]) -> int:
 def read_sheet_to_dataframe(
     sheet_id: str, sheet_name: str, header_row_index: Optional[int] = None
 ) -> Optional[pd.DataFrame]:
-    """
-    Считывает данные с указанного листа Google Sheets в DataFrame.
-    Если header_row_index не задан, пытается найти строку заголовков автоматически.
-    """
     service = get_sheets_service()
     if service is None:
         log.error("Google Sheets сервис недоступен – невозможно прочитать лист.")
@@ -237,13 +224,6 @@ def get_db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """
-    Создаёт все таблицы:
-    - schedule_settings
-    - approvers
-    - schedule_files
-    - schedule_approvals
-    """
     conn = get_db()
     c = conn.cursor()
 
@@ -274,14 +254,13 @@ def init_db() -> None:
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                version INTEGER,
                approver TEXT,
-               status TEXT,           -- pending / approved / rework
+               status TEXT,
                comment TEXT,
                decided_at TEXT,
                requested_at TEXT
            )"""
     )
 
-    # начальные настройки
     c.execute("SELECT COUNT(*) AS c FROM approvers")
     if c.fetchone()["c"] == 0:
         c.executemany(
@@ -311,9 +290,6 @@ def init_db() -> None:
     conn.close()
 
 
-# -------------------------------------------------
-# Получение состояния графика
-# -------------------------------------------------
 def get_schedule_state() -> dict:
     conn = get_db()
     c = conn.cursor()
@@ -348,7 +324,6 @@ def set_current_approvers_for_version(approvers: List[str], version: int) -> Non
         (",".join(approvers),),
     )
 
-    # очистка старых статусов
     c.execute("DELETE FROM schedule_approvals WHERE version = ?", (version,))
 
     now = local_now().isoformat()
@@ -467,8 +442,6 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
 # -------------------------------------------------
 # КРАСИВЫЙ EXCEL ДЛЯ ГРАФИКА
 # -------------------------------------------------
-
-# Цвета шапки и границы
 HEADER_FILL = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
 BORDER = Border(
@@ -484,19 +457,23 @@ async def send_schedule_xlsx(
 ):
     """
     Отправляет красиво отформатированный Excel-файл графика
+    с блоком согласования внизу листа.
     """
-    # Убираем лишние индексы и делаем копию
     df = dataframe.copy().reset_index(drop=True)
-    df.index += 1  # нумерация с 1
+    df.index += 1
 
-    # Создаём файл в памяти
+    settings = get_schedule_state()
+    version = get_schedule_version(settings)
+    approvals = get_schedule_approvals(version)
+
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        # данные с 3-й строки (A3) — место для шапки над ними
         df.to_excel(
             writer,
             sheet_name="График выездов",
             index=True,
-            startrow=1,
+            startrow=2,
             header=False,
         )
 
@@ -511,7 +488,7 @@ async def send_schedule_xlsx(
             cell.font = HEADER_FONT
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        # === Автоширина колонок ===
+        # === Автоширина ===
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -521,22 +498,17 @@ async def send_schedule_xlsx(
                         max_length = len(str(cell.value))
                 except Exception:
                     pass
-            adjusted_width = min(max_length + 4, 50)
-            ws.column_dimensions[column_letter].width = adjusted_width
+            ws.column_dimensions[column_letter].width = min(max_length + 4, 50)
 
-        # === Заморозить шапку и первую строку (№ п/п + заголовки) ===
-        ws.freeze_panes = ws["B3"]  # всё что выше и левее B3 — замораживается
+        ws.freeze_panes = ws["B3"]
 
-        # === Добавляем фильтры на всю таблицу ===
         last_col_letter = chr(64 + len(headers))
         ws.auto_filter.ref = f"A2:{last_col_letter}{len(df) + 2}"
 
-        # === Тонкие границы для всех ячеек с данными ===
         for row in ws[f"A3:{last_col_letter}{len(df) + 2}"]:
             for cell in row:
                 cell.border = BORDER
 
-        # === Заливка чередующихся строк (зебра) ===
         LIGHT_FILL = PatternFill(
             start_color="F0F0F0", end_color="F0F0F0", fill_type="solid"
         )
@@ -547,7 +519,6 @@ async def send_schedule_xlsx(
                 for cell in row:
                     cell.fill = LIGHT_FILL
 
-        # === Добавляем таблицу Excel (чтобы фильтры и стили сохранялись) ===
         tab = Table(
             displayName="ScheduleTable",
             ref=f"A2:{last_col_letter}{len(df) + 2}",
@@ -560,6 +531,68 @@ async def send_schedule_xlsx(
             showColumnStripes=False,
         )
         ws.add_table(tab)
+
+        # ----- красивый блок согласования внизу -----
+        if approvals:
+            last_data_row = len(df) + 2
+            summary_start = last_data_row + 2  # отступ пустой строкой
+
+            # 1) Заголовок с периодом
+            header_text = build_schedule_header(version, approvals)
+            ws.merge_cells(f"A{summary_start}:{last_col_letter}{summary_start}")
+            cell_header = ws[f"A{summary_start}"]
+            cell_header.value = header_text
+            cell_header.font = Font(bold=True, size=12, color="FFFFFF")
+            cell_header.fill = PatternFill(
+                start_color="4F81BD", end_color="4F81BD", fill_type="solid"
+            )
+            cell_header.alignment = Alignment(
+                horizontal="center", vertical="center"
+            )
+
+            # 2) "Согласовано всеми:"
+            sub_row = summary_start + 1
+            ws.merge_cells(f"A{sub_row}:{last_col_letter}{sub_row}")
+            cell_sub = ws[f"A{sub_row}"]
+            cell_sub.value = "Согласовано всеми:"
+            cell_sub.font = Font(bold=True, size=11)
+            cell_sub.alignment = Alignment(
+                horizontal="left", vertical="center"
+            )
+
+            # 3) список согласовавших
+            row_ptr = sub_row + 1
+            approved_rows = [r for r in approvals if r["status"] == "approved"]
+            others = [r for r in approvals if r["status"] != "approved"]
+
+            list_fill = PatternFill(
+                start_color="D9E1F2", end_color="D9E1F2", fill_type="solid"
+            )
+
+            for r in approved_rows:
+                line = f"• {r['approver']} — {_format_dt(r['decided_at'])} ✅"
+                ws.merge_cells(f"A{row_ptr}:{last_col_letter}{row_ptr}")
+                cell = ws[f"A{row_ptr}"]
+                cell.value = line
+                cell.fill = list_fill
+                cell.font = Font(size=11)
+                cell.alignment = Alignment(
+                    horizontal="left", vertical="center"
+                )
+                for col_idx in range(1, len(headers) + 1):
+                    ws.cell(row=row_ptr, column=col_idx).border = BORDER
+                row_ptr += 1
+
+            if others:
+                ws.merge_cells(f"A{row_ptr}:{last_col_letter}{row_ptr}")
+                cell_pending = ws[f"A{row_ptr}"]
+                cell_pending.value = "⚠ Есть несогласованные/на доработке."
+                cell_pending.font = Font(italic=True, color="C00000")
+                cell_pending.alignment = Alignment(
+                    horizontal="left", vertical="center"
+                )
+                for col_idx in range(1, len(headers) + 1):
+                    ws.cell(row=row_ptr, column=col_idx).border = BORDER
 
     bio.seek(0)
     filename = f"График_выездов_СОТ_{date.today().strftime('%d.%m.%Y')}.xlsx"
@@ -585,9 +618,6 @@ def _format_dt(iso_str: Optional[str]) -> str:
 
 
 def _compute_schedule_dates(approvals: List[sqlite3.Row]) -> (Optional[date], Optional[date]):
-    """
-    Берём дату последнего согласования и считаем диапазон +4 дня.
-    """
     dates: List[date] = []
     for r in approvals:
         if r["status"] == "approved" and r["decided_at"]:
@@ -598,10 +628,9 @@ def _compute_schedule_dates(approvals: List[sqlite3.Row]) -> (Optional[date], Op
                 pass
     if not dates:
         return None, None
-
     base = max(dates)
     d_from = base
-    d_to = base + timedelta(days=4)  # всего 5 календарных дней
+    d_to = base + timedelta(days=4)
     return d_from, d_to
 
 
@@ -613,44 +642,42 @@ def build_schedule_header(version: int, approvals: List[sqlite3.Row]) -> str:
 
 
 def write_schedule_summary_to_sheet(version: int, approvals: List[sqlite3.Row]) -> None:
-    """
-    Дописывает в самый низ листа 'График' итог согласования:
-    - заголовок с датами (build_schedule_header)
-    - строку 'Согласовано всеми:'
-    - список согласовавших с датами
-    """
     service = get_sheets_service()
     if service is None:
         log.error(
             "Google Sheets сервис недоступен – не могу записать итог согласования в 'График'."
         )
-        return
+    else:
+        sheet_name = "График"
+        header = build_schedule_header(version, approvals)
+        rows = [
+            [""],
+            [header],
+            ["Согласовано всеми:"],
+        ]
+        for r in approvals:
+            line = f"{r['approver']} — {_format_dt(r['decided_at'])} ✅"
+            rows.append([line])
 
-    sheet_name = "График"
+        body = {"values": rows}
 
-    header = build_schedule_header(version, approvals)
-    rows = [
-        [""],  # пустая строка-разделитель
-        [header],
-        ["Согласовано всеми:"],
-    ]
-    for r in approvals:
-        line = f"{r['approver']} — {_format_dt(r['decided_at'])} ✅"
-        rows.append([line])
-
-    body = {"values": rows}
-
-    try:
-        service.spreadsheets().values().append(
-            spreadsheetId=GSHEETS_SPREADSHEET_ID,
-            range=f"'{sheet_name}'!A1",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body=body,
-        ).execute()
-        log.info("Итог согласования версии %s дописан в лист '%s'.", version, sheet_name)
-    except Exception as e:
-        log.error("Ошибка записи итога согласования в лист '%s': %s", sheet_name, e)
+        try:
+            service.spreadsheets().values().append(
+                spreadsheetId=GSHEETS_SPREADSHEET_ID,
+                range=f"'{sheet_name}'!A1",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body=body,
+            ).execute()
+            log.info(
+                "Итог согласования версии %s дописан в лист '%s'.",
+                version,
+                sheet_name,
+            )
+        except Exception as e:
+            log.error(
+                "Ошибка записи итога согласования в лист '%s': %s", sheet_name, e
+            )
 
 
 def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
@@ -852,16 +879,16 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
         )
 
         row = [
-            "",  # A
-            form.get("date").strftime("%d.%m.%Y") if form.get("date") else "",  # B дата
-            "",  # C
-            D_value,  # D объединённые площадь + этажи
-            form.get("onzs", ""),  # E
-            form.get("developer", ""),  # F
-            form.get("object", ""),  # G
-            form.get("address", ""),  # H
-            form.get("case", ""),  # I
-            form.get("check_type", ""),  # J вид проверки
+            "",
+            form.get("date").strftime("%d.%m.%Y") if form.get("date") else "",
+            "",
+            D_value,
+            form.get("onzs", ""),
+            form.get("developer", ""),
+            form.get("object", ""),
+            form.get("address", ""),
+            form.get("case", ""),
+            form.get("check_type", ""),
         ]
 
         body = {"values": [row]}
@@ -967,7 +994,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------------------------------
-# ОНзС — клавиатура и вывод по цифре 1–12
+# ОНзС
 # -------------------------------------------------
 def onzs_menu_inline() -> InlineKeyboardMarkup:
     buttons = []
@@ -983,9 +1010,9 @@ def onzs_menu_inline() -> InlineKeyboardMarkup:
 
 
 def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
-    col_case = get_col_by_letter(df, "I")  # Номер дела
-    col_onzs = get_col_by_letter(df, "E")  # ОНзС
-    col_addr = get_col_by_letter(df, "H")  # Адрес
+    col_case = get_col_by_letter(df, "I")
+    col_onzs = get_col_by_letter(df, "E")
+    col_addr = get_col_by_letter(df, "H")
 
     if not col_case or not col_onzs:
         return "Не удалось определить структуру файла."
@@ -1037,7 +1064,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # ИСПОЛЬЗУЕМ НОВУЮ КРАСИВУЮ ВЫГРУЗКУ
         await send_schedule_xlsx(
             chat_id=query.message.chat.id,
             dataframe=df,
@@ -1062,7 +1088,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---------- Согласование графика ----------
+    # ---------- Согласование ----------
     if data.startswith("schedule_approve:") or data.startswith("schedule_rework:"):
         action, approver_tag = data.split(":", 1)
         user_username = user.username or ""
@@ -1081,7 +1107,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{approver_tag} согласовал(а) график. Спасибо!"
             )
 
-            # Проверяем, все ли согласовали
             approvals = get_schedule_approvals(version)
             if approvals and all(r["status"] == "approved" for r in approvals):
                 header = build_schedule_header(version, approvals)
@@ -1092,10 +1117,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 text = "\n".join(lines)
 
-                # 1) Пишем итог в самый низ листа "График"
                 write_schedule_summary_to_sheet(version, approvals)
 
-                # 2) Отправляем в канал/группу, если указан chat_id
                 if SCHEDULE_NOTIFY_CHAT_ID is not None:
                     try:
                         await context.bot.send_message(
@@ -1107,7 +1130,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             SCHEDULE_NOTIFY_CHAT_ID,
                             e,
                         )
-
             return
 
         if action == "schedule_rework":
@@ -1140,7 +1162,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---------- ОНЗС (1–12) ----------
+    # ---------- ОНЗС ----------
     if data.startswith("onzs_filter_"):
         number = data.replace("onzs_filter_", "")
         df = get_remarks_df_current()
@@ -1165,7 +1187,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     chat = update.message.chat
 
-    # --- комментарий от "На доработку" ---
     if context.user_data.get("awaiting_rework_comment"):
         info = context.user_data.pop("awaiting_rework_comment")
         version = info["version"]
@@ -1177,7 +1198,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- ввод согласующих ---
     if context.user_data.get("awaiting_approvers_input"):
         info = context.user_data.pop("awaiting_approvers_input")
         version = info["version"]
@@ -1227,14 +1247,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Согласующие сохранены и уведомлены.")
         return
 
-    # --- обработка инспектора ---
     if context.user_data.get("inspector_form"):
         await inspector_process(update, context)
         return
 
     low = text.lower()
 
-    # ---------- МЕНЮ ----------
     if low == "📅 график".lower():
         settings = get_schedule_state()
         is_adm = is_admin(update.effective_user.id)
@@ -1277,7 +1295,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Пока нет данных по согласованию графика.")
             return
 
-        # группируем по версиям
         by_ver: Dict[int, List[sqlite3.Row]] = {}
         for r in rows:
             by_ver.setdefault(r["version"], []).append(r)
@@ -1311,7 +1328,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_text(chat, "\n".join(lines))
         return
 
-    # --- DEFAULT ---
     await update.message.reply_text(
         "Я вас не понял. Выберите пункт меню или нажмите /start.",
         reply_markup=main_menu(),
