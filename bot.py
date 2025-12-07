@@ -991,8 +991,17 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
 # -------------------------------------------------
 async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    form = context.user_data.get("inspector_form", {})
+    form = context.user_data.get("inspector_form", {}) or {}
     step = form.get("step")
+
+    # если step потерялся – перезапускаем мастер
+    if not step:
+        context.user_data["inspector_form"] = {"step": "date"}
+        await update.message.reply_text(
+            "👮‍♂️ Новый выезд инспектора\n\n"
+            "1/8. Дата выезда (ДД.ММ.ГГГГ):"
+        )
+        return
 
     if step == "date":
         try:
@@ -1377,6 +1386,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     chat = update.message.chat
 
+    # --- СНАЧАЛА мастер «Инспектор» ---
+    if "inspector_form" in context.user_data:
+        await inspector_process(update, context)
+        return
+
     # комментарий к "На доработку"
     if context.user_data.get("awaiting_rework_comment"):
         info = context.user_data.pop("awaiting_rework_comment")
@@ -1437,11 +1451,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await chat.send_message("\n".join(lines), reply_markup=kb)
         await update.message.reply_text("Согласующие сохранены и уведомлены.")
-        return
-
-    # мастер инспектора
-    if "inspector_form" in context.user_data:
-        await inspector_process(update, context)
         return
 
     low = text.lower()
