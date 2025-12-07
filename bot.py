@@ -28,6 +28,10 @@ from telegram.ext import (
     filters,
 )
 
+# ДОБАВЛЕНО: стили для красивого Excel
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.worksheet.table import Table, TableStyleInfo
+
 AnyType = Any
 
 # ----------------- ЛОГИ -----------------
@@ -461,6 +465,113 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
 
 
 # -------------------------------------------------
+# КРАСИВЫЙ EXCEL ДЛЯ ГРАФИКА
+# -------------------------------------------------
+
+# Цвета шапки и границы
+HEADER_FILL = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
+HEADER_FONT = Font(color="FFFFFF", bold=True)
+BORDER = Border(
+    left=Side(style="thin"),
+    right=Side(style="thin"),
+    top=Side(style="thin"),
+    bottom=Side(style="thin"),
+)
+
+
+async def send_schedule_xlsx(
+    chat_id: int, dataframe: pd.DataFrame, context: ContextTypes.DEFAULT_TYPE
+):
+    """
+    Отправляет красиво отформатированный Excel-файл графика
+    """
+    # Убираем лишние индексы и делаем копию
+    df = dataframe.copy().reset_index(drop=True)
+    df.index += 1  # нумерация с 1
+
+    # Создаём файл в памяти
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(
+            writer,
+            sheet_name="График выездов",
+            index=True,
+            startrow=1,
+            header=False,
+        )
+
+        wb = writer.book
+        ws = writer.sheets["График выездов"]
+
+        # === Заголовки ===
+        headers = ["№ п/п"] + list(dataframe.columns)
+        for col_num, value in enumerate(headers, 1):
+            cell = ws.cell(row=2, column=col_num, value=value)
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        # === Автоширина колонок ===
+        for column in ws.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except Exception:
+                    pass
+            adjusted_width = min(max_length + 4, 50)
+            ws.column_dimensions[column_letter].width = adjusted_width
+
+        # === Заморозить шапку и первую строку (№ п/п + заголовки) ===
+        ws.freeze_panes = ws["B3"]  # всё что выше и левее B3 — замораживается
+
+        # === Добавляем фильтры на всю таблицу ===
+        last_col_letter = chr(64 + len(headers))
+        ws.auto_filter.ref = f"A2:{last_col_letter}{len(df) + 2}"
+
+        # === Тонкие границы для всех ячеек с данными ===
+        for row in ws[f"A3:{last_col_letter}{len(df) + 2}"]:
+            for cell in row:
+                cell.border = BORDER
+
+        # === Заливка чередующихся строк (зебра) ===
+        LIGHT_FILL = PatternFill(
+            start_color="F0F0F0", end_color="F0F0F0", fill_type="solid"
+        )
+        for idx, row in enumerate(
+            ws.iter_rows(min_row=3, max_row=len(df) + 2), start=3
+        ):
+            if idx % 2 == 0:
+                for cell in row:
+                    cell.fill = LIGHT_FILL
+
+        # === Добавляем таблицу Excel (чтобы фильтры и стили сохранялись) ===
+        tab = Table(
+            displayName="ScheduleTable",
+            ref=f"A2:{last_col_letter}{len(df) + 2}",
+        )
+        tab.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium9",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(tab)
+
+    bio.seek(0)
+    filename = f"График_выездов_СОТ_{date.today().strftime('%d.%m.%Y')}.xlsx"
+
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(bio, filename=filename),
+        caption="График выездов отдела СОТ",
+    )
+
+
+# -------------------------------------------------
 # Текст графика со статусами
 # -------------------------------------------------
 def _format_dt(iso_str: Optional[str]) -> str:
@@ -885,15 +996,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        buf = BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="График", index=False)
-        buf.seek(0)
-
-        filename = f"График_{local_now().date().isoformat()}.xlsx"
-        await query.message.reply_document(
-            document=InputFile(buf, filename=filename),
-            caption="Файл графика (лист «График»).",
+        # ИСПОЛЬЗУЕМ НОВУЮ КРАСИВУЮ ВЫГРУЗКУ
+        await send_schedule_xlsx(
+            chat_id=query.message.chat.id,
+            dataframe=df,
+            context=context,
         )
         return
 
