@@ -928,7 +928,7 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
 
 
 # -------------------------------------------------
-# Инспектор → Google Sheets (опционально)
+# Инспектор → Google Sheets (ячейка D с двумя строками)
 # -------------------------------------------------
 def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
     """
@@ -941,9 +941,13 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
         return False
 
     try:
+        # Оформляем как в вашей таблице: две строки в одной ячейке
+        area_str = str(form.get("area", "")).replace(".", ",")
+        floors_str = str(form.get("floors", ""))
+
         d_value = (
-            f"Площадь (кв.м): {form.get('area', '')}; "
-            f"Количество этажей: {form.get('floors', '')}"
+            f"Площадь (кв.м): {area_str}\n"
+            f"Количество этажей: {floors_str}"
         )
 
         row = [
@@ -994,6 +998,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             form["date"] = datetime.strptime(text, "%d.%m.%Y").date()
             form["step"] = "area"
+            context.user_data["inspector_form"] = form
             await update.message.reply_text("1/8. Площадь объекта (кв.м):")
         except Exception:
             await update.message.reply_text(
@@ -1004,42 +1009,49 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "area":
         form["area"] = text
         form["step"] = "floors"
+        context.user_data["inspector_form"] = form
         await update.message.reply_text("2/8. Количество этажей:")
         return
 
     if step == "floors":
         form["floors"] = text
         form["step"] = "onzs"
+        context.user_data["inspector_form"] = form
         await update.message.reply_text("3/8. ОНзС (1–12):")
         return
 
     if step == "onzs":
         form["onzs"] = text
         form["step"] = "developer"
+        context.user_data["inspector_form"] = form
         await update.message.reply_text("4/8. Наименование застройщика:")
         return
 
     if step == "developer":
         form["developer"] = text
         form["step"] = "object"
+        context.user_data["inspector_form"] = form
         await update.message.reply_text("5/8. Наименование объекта:")
         return
 
     if step == "object":
         form["object"] = text
         form["step"] = "address"
+        context.user_data["inspector_form"] = form
         await update.message.reply_text("6/8. Строительный адрес:")
         return
 
     if step == "address":
         form["address"] = text
         form["step"] = "case"
+        context.user_data["inspector_form"] = form
         await update.message.reply_text("7/8. Номер дела (формат 00-00-000000):")
         return
 
     if step == "case":
         form["case"] = text
         form["step"] = "check_type"
+        context.user_data["inspector_form"] = form
         await update.message.reply_text(
             "8/8. Вид проверки (ПП, итоговая, профвизит, поручение и т.п.):"
         )
@@ -1048,6 +1060,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "check_type":
         form["check_type"] = text
         form["step"] = "done"
+        context.user_data["inspector_form"] = form
 
         await update.message.reply_text("⏳ Сохраняю выезд...")
 
@@ -1072,7 +1085,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         await update.message.reply_text(msg)
-        context.user_data["inspector_form"] = None
+        context.user_data.pop("inspector_form", None)
         return
 
 
@@ -1427,7 +1440,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # мастер инспектора
-    if context.user_data.get("inspector_form"):
+    if "inspector_form" in context.user_data:
         await inspector_process(update, context)
         return
 
