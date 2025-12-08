@@ -214,6 +214,24 @@ def get_col_by_letter(df: pd.DataFrame, letters: str) -> Optional[str]:
     return None
 
 
+def get_col_index_by_header(
+    df: pd.DataFrame, search_substr: str, fallback_letter: str
+) -> Optional[int]:
+    """
+    Возвращает индекс столбца по части заголовка (без регистра),
+    при неудаче — индекс по букве столбца.
+    """
+    search_substr = search_substr.lower()
+    for i, col in enumerate(df.columns):
+        if search_substr in str(col).lower():
+            return i
+    # fallback по букве
+    idx = excel_col_to_index(fallback_letter)
+    if 0 <= idx < len(df.columns):
+        return idx
+    return None
+
+
 # -------------------------------------------------
 # БАЗА ДАННЫХ (график + согласование + инспектор)
 # -------------------------------------------------
@@ -441,17 +459,27 @@ def fetch_inspector_visits(limit: int = 50) -> List[sqlite3.Row]:
 # Клавиатуры
 # -------------------------------------------------
 def main_menu() -> ReplyKeyboardMarkup:
+    """
+    Главное меню:
+    📅 График     📝 Замечания
+    Инспектор     📈 Аналитика
+    """
     return ReplyKeyboardMarkup(
         [
             ["📅 График", "📝 Замечания"],
-            ["📊 Итоговая", "🏗 ОНзС"],
             ["Инспектор", "📈 Аналитика"],
         ],
         resize_keyboard=True,
     )
 
 
-def build_schedule_inline(is_admin_flag: bool, settings: dict):
+def build_schedule_inline(
+    is_admin_flag: bool, settings: dict, user_tag: Optional[str] = None
+) -> InlineKeyboardMarkup:
+    """
+    Кнопки для раздела «График», плюс при необходимости
+    личные кнопки согласования для текущего пользователя.
+    """
     buttons = [
         [
             InlineKeyboardButton("🔄 Обновить", callback_data="schedule_refresh"),
@@ -463,13 +491,40 @@ def build_schedule_inline(is_admin_flag: bool, settings: dict):
         buttons.append(
             [InlineKeyboardButton("👥 Согласующие", callback_data="schedule_approvers")]
         )
+
+    approvers = get_current_approvers(settings)
+    if user_tag and user_tag in approvers:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"✅ Согласовать ({user_tag})",
+                    callback_data=f"schedule_approve:{user_tag}",
+                ),
+                InlineKeyboardButton(
+                    f"✏️ На доработку ({user_tag})",
+                    callback_data=f"schedule_rework:{user_tag}",
+                ),
+            ]
+        )
+
     return InlineKeyboardMarkup(buttons)
 
 
 def remarks_menu_inline() -> InlineKeyboardMarkup:
+    """
+    Раздел «Замечания»:
+    - Поиск по номеру дела
+    - ОНзС (выбор 1–12, список дел, неустранённые)
+    - Открыть файл
+    """
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("❌ Не устранены", callback_data="remarks_not_done")],
+            [
+                InlineKeyboardButton(
+                    "🔎 Поиск по номеру дела", callback_data="remarks_search_case"
+                )
+            ],
+            [InlineKeyboardButton("🏗 ОНзС", callback_data="remarks_onzs")],
             [InlineKeyboardButton("📥 Открыть файл", callback_data="remarks_download")],
         ]
     )
@@ -481,7 +536,9 @@ def inspector_menu_inline() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("➕ Добавить выезд", callback_data="inspector_add")],
             [
                 InlineKeyboardButton("📋 Список выездов", callback_data="inspector_list"),
-                InlineKeyboardButton("📥 Скачать Excel", callback_data="inspector_download"),
+                InlineKeyboardButton(
+                    "📥 Скачать Excel", callback_data="inspector_download"
+                ),
             ],
         ]
     )
@@ -533,9 +590,28 @@ async def send_schedule_xlsx(
     """
     Отправляет красиво отформатированный Excel-файл графика
     с блоком согласования внизу листа.
+    Требования:
+    - убрать «№ п/п»;
+    - «Дата выезда» — короткий формат даты;
+    - «ОНзС» — центр;
+    - F/G — перенос текста.
     """
     df = dataframe.copy().reset_index(drop=True)
-    df.index += 1
+    headers = list(df.columns)
+
+    # Попробуем привести «Дата выезда» к дате
+    date_col_name: Optional[str] = None
+    for h in headers:
+        if "дата выезда" in str(h).lower():
+            date_col_name = h
+            break
+    if date_col_name:
+        try:
+            df[date_col_name] = pd.to_datetime(
+                df[date_col_name], errors="coerce", dayfirst=True
+            )
+        except Exception:
+            pass
 
     settings = get_schedule_state()
     version = get_schedule_version(settings)
@@ -543,10 +619,11 @@ async def send_schedule_xlsx(
 
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        # Пишем данные без индекса, шапку создаём вручную
         df.to_excel(
             writer,
             sheet_name="График выездов",
-            index=True,
+            index=False,
             startrow=2,  # данные с 3-й строки (A3)
             header=False,
         )
@@ -554,7 +631,7 @@ async def send_schedule_xlsx(
         wb = writer.book
         ws = writer.sheets["График выездов"]
 
-        headers = ["№ п/п"] + list(dataframe.columns)
+        # Заголовки (без «№ п/п»)
         for col_num, value in enumerate(headers, 1):
             cell = ws.cell(row=2, column=col_num, value=value)
             cell.fill = HEADER_FILL
@@ -564,20 +641,22 @@ async def send_schedule_xlsx(
         # автоширина
         for column in ws.columns:
             max_length = 0
-            column_letter = column[0].column_letter
+            col_letter = column[0].column_letter
             for cell in column:
                 try:
-                    if len(str(cell.value)) > max_length:
+                    if cell.value is not None and len(str(cell.value)) > max_length:
                         max_length = len(str(cell.value))
                 except Exception:
                     pass
-            ws.column_dimensions[column_letter].width = min(max_length + 4, 50)
+            ws.column_dimensions[col_letter].width = min(max_length + 4, 50)
 
-        ws.freeze_panes = ws["B3"]
+        # заморозка верхней строки заголовков
+        ws.freeze_panes = ws["A3"]
 
-        last_col_letter = chr(64 + len(headers))
+        last_col_letter = ws.cell(row=2, column=len(headers)).column_letter
         ws.auto_filter.ref = f"A2:{last_col_letter}{len(df) + 2}"
 
+        # рамки
         for row in ws[f"A3:{last_col_letter}{len(df) + 2}"]:
             for cell in row:
                 cell.border = BORDER
@@ -604,6 +683,45 @@ async def send_schedule_xlsx(
             showColumnStripes=False,
         )
         ws.add_table(tab)
+
+        # Дополнительное форматирование конкретных столбцов
+        # попытаемся найти нужные колонки по заголовкам
+        date_idx = None
+        onzs_idx = None
+        dev_idx = None
+        obj_idx = None
+
+        for i, h in enumerate(headers, start=1):
+            h_low = str(h).lower()
+            if date_idx is None and "дата выезда" in h_low:
+                date_idx = i
+            if onzs_idx is None and "онзс" in h_low:
+                onzs_idx = i
+            if dev_idx is None and "наименование застройщика" in h_low:
+                dev_idx = i
+            if obj_idx is None and "наименование объекта" in h_low:
+                obj_idx = i
+
+        # Применяем форматирование по строкам данных
+        for row_idx in range(3, len(df) + 3):
+            if date_idx:
+                cell = ws.cell(row=row_idx, column=date_idx)
+                cell.number_format = "DD.MM.YYYY"
+            if onzs_idx:
+                cell = ws.cell(row=row_idx, column=onzs_idx)
+                cell.alignment = Alignment(
+                    horizontal="center", vertical="center", wrap_text=False
+                )
+            if dev_idx:
+                cell = ws.cell(row=row_idx, column=dev_idx)
+                cell.alignment = Alignment(
+                    horizontal="left", vertical="center", wrap_text=True
+                )
+            if obj_idx:
+                cell = ws.cell(row=row_idx, column=obj_idx)
+                cell.alignment = Alignment(
+                    horizontal="left", vertical="center", wrap_text=True
+                )
 
         # красивый блок согласования
         if approvals:
@@ -652,7 +770,9 @@ async def send_schedule_xlsx(
                 cell_pending = ws[f"A{row_ptr}"]
                 cell_pending.value = "⚠ Есть несогласованные/на доработке."
                 cell_pending.font = Font(italic=True, color="C00000")
-                cell_pending.alignment = Alignment(horizontal="left", vertical="center")
+                cell_pending.alignment = Alignment(
+                    horizontal="left", vertical="center"
+                )
                 for col_idx in range(1, len(headers) + 1):
                     ws.cell(row=row_ptr, column=col_idx).border = BORDER
 
@@ -796,7 +916,7 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
 
 
 # -------------------------------------------------
-# Замечания: НЕ УСТРАНЕНЫ
+# Замечания: НЕ УСТРАНЕНЫ (общий список)
 # -------------------------------------------------
 def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     COLS = {
@@ -836,10 +956,10 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
             continue
 
         flags = {
-            "pb": is_net(row.iloc[idx_pb]),
-            "pb_zk": is_net(row.iloc[idx_pb_zk]),
-            "ar": is_net(row.iloc[idx_ar]),
-            "eom": is_net(row.iloc[idx_eom]),
+            "pb": is_net(row.iloc[idx_pb]) if idx_pb < len(row) else False,
+            "pb_zk": is_net(row.iloc[idx_pb_zk]) if idx_pb_zk < len(row) else False,
+            "ar": is_net(row.iloc[idx_ar]) if idx_ar < len(row) else False,
+            "eom": is_net(row.iloc[idx_eom]) if idx_eom < len(row) else False,
         }
 
         if not any(flags.values()):
@@ -885,6 +1005,238 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
                 + ", ".join(b + " - нет" for b in blocks["eom"])
             )
         lines.append(f"• {case} — " + "; ".join(parts))
+
+    return "\n".join(lines)
+
+
+def build_remarks_not_done_by_onzs(df: pd.DataFrame, onzs_value: str) -> str:
+    """
+    Строки со статусом «нет» только для выбранного ОНзС.
+    """
+    sheet_name = get_current_remarks_sheet_name()
+
+    # Столбец ОНзС
+    onzs_idx = get_col_index_by_header(df, "онзс", "E")
+    if onzs_idx is None:
+        return "Не удалось определить столбец ОНзС в файле замечаний."
+
+    COLS = {
+        "case": "I",
+        "pb": "Q",
+        "pb_zk": "R",
+        "ar": "X",
+        "eom": "AD",
+    }
+
+    TITLES = {
+        "pb": "Отметка об устранении замечаний ПБ да/нет",
+        "pb_zk": "Отметка об устранении замечаний ПБ в ЗК КНД да/нет",
+        "ar": "Отметка об устранении нарушений АР, ММГН, АГО да/нет",
+        "eom": "Отметка об устранении нарушений ЭОМ да/нет",
+    }
+
+    idx_case = excel_col_to_index(COLS["case"])
+    idx_pb = excel_col_to_index(COLS["pb"])
+    idx_pb_zk = excel_col_to_index(COLS["pb_zk"])
+    idx_ar = excel_col_to_index(COLS["ar"])
+    idx_eom = excel_col_to_index(COLS["eom"])
+
+    def is_net(val):
+        if val is None:
+            return False
+        text = str(val).lower().replace("\n", " ").strip()
+        if not text or text in {"-", "н/д"}:
+            return False
+        return text.startswith("нет")
+
+    grouped = {}
+
+    for _, row in df.iterrows():
+        # фильтрация по ОНзС
+        val_onzs = ""
+        try:
+            val_onzs = str(row.iloc[onzs_idx]).strip()
+        except Exception:
+            pass
+
+        if val_onzs != str(onzs_value).strip():
+            continue
+
+        case = ""
+        try:
+            case = str(row.iloc[idx_case]).strip()
+        except Exception:
+            pass
+
+        if not case:
+            continue
+
+        flags = {
+            "pb": is_net(row.iloc[idx_pb]) if idx_pb < len(row) else False,
+            "pb_zk": is_net(row.iloc[idx_pb_zk]) if idx_pb_zk < len(row) else False,
+            "ar": is_net(row.iloc[idx_ar]) if idx_ar < len(row) else False,
+            "eom": is_net(row.iloc[idx_eom]) if idx_eom < len(row) else False,
+        }
+
+        if not any(flags.values()):
+            continue
+
+        if case not in grouped:
+            grouped[case] = {"pb": set(), "ar": set(), "eom": set()}
+
+        if flags["pb"]:
+            grouped[case]["pb"].add(TITLES["pb"])
+        if flags["pb_zk"]:
+            grouped[case]["pb"].add(TITLES["pb_zk"])
+        if flags["ar"]:
+            grouped[case]["ar"].add(TITLES["ar"])
+        if flags["eom"]:
+            grouped[case]["eom"].add(TITLES["eom"])
+
+    if not grouped:
+        return (
+            f"По ОНзС {onzs_value} нет строк со статусом «нет».\n"
+            f"Лист: {sheet_name}"
+        )
+
+    lines = [
+        f"Строки со статусом «НЕ УСТРАНЕНЫ (нет)» по ОНзС {onzs_value}",
+        "",
+        "Лист: " + sheet_name,
+        "",
+    ]
+
+    for case, blocks in grouped.items():
+        parts = []
+        if blocks["pb"]:
+            parts.append(
+                "Пожарная безопасность: "
+                + ", ".join(b + " - нет" for b in blocks["pb"])
+            )
+        if blocks["ar"]:
+            parts.append(
+                "Архитектура, ММГН, АГО: "
+                + ", ".join(b + " - нет" for b in blocks["ar"])
+            )
+        if blocks["eom"]:
+            parts.append(
+                "Электроснабжение: "
+                + ", ".join(b + " - нет" for b in blocks["eom"])
+            )
+        lines.append(f"• {case} — " + "; ".join(parts))
+
+    return "\n".join(lines)
+
+
+def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
+    """
+    Поиск по номеру дела в листе замечаний и красивый вывод карточек.
+    """
+    sheet_name = get_current_remarks_sheet_name()
+
+    case_no = case_no.strip()
+    if not case_no:
+        return "Номер дела не указан."
+
+    # Индексы основных столбцов
+    idx_case = get_col_index_by_header(df, "номер дела", "I")
+    if idx_case is None:
+        # запасной вариант (если всё сдвинуто)
+        idx_case = get_col_index_by_header(df, "номер дела", "H")
+
+    if idx_case is None:
+        return "Не удалось определить столбец «Номер дела» в файле замечаний."
+
+    idx_date = get_col_index_by_header(df, "дата выезда", "B")
+    idx_onzs = get_col_index_by_header(df, "онзс", "E")
+    idx_dev = get_col_index_by_header(df, "наименование застройщика", "F")
+    idx_obj = get_col_index_by_header(df, "наименование объекта", "G")
+    idx_addr = get_col_index_by_header(df, "строительный адрес", "H")
+
+    idx_pb = excel_col_to_index("Q")
+    idx_pb_zk = excel_col_to_index("R")
+    idx_ar = excel_col_to_index("X")
+    idx_eom = excel_col_to_index("AD")
+
+    # фильтрация по номеру дела
+    mask = []
+    for _, row in df.iterrows():
+        try:
+            val = str(row.iloc[idx_case]).strip()
+        except Exception:
+            val = ""
+        mask.append(val == case_no)
+
+    if not any(mask):
+        return f"По номеру дела {case_no} ничего не найдено.\nЛист: {sheet_name}"
+
+    df_sel = df[[m for m in mask]]
+
+    lines: List[str] = [
+        f"Результаты поиска по номеру дела: {case_no}",
+        "",
+        f"Лист: {sheet_name}",
+        "",
+    ]
+
+    for _, row in df_sel.iterrows():
+        def safe(idx: Optional[int]) -> str:
+            if idx is None:
+                return ""
+            try:
+                return str(row.iloc[idx]).strip()
+            except Exception:
+                return ""
+
+        date_raw = safe(idx_date)
+        date_fmt = date_raw
+        # Попробуем привести к дате
+        try:
+            if date_raw:
+                dt = pd.to_datetime(date_raw, dayfirst=True, errors="ignore")
+                if isinstance(dt, (datetime, pd.Timestamp)):
+                    date_fmt = dt.strftime("%d.%m.%Y")
+        except Exception:
+            pass
+
+        onzs_val = safe(idx_onzs)
+        dev_val = safe(idx_dev)
+        obj_val = safe(idx_obj)
+        addr_val = safe(idx_addr)
+
+        def safe_status(idx: int) -> str:
+            try:
+                if idx < len(row):
+                    return str(row.iloc[idx]).strip()
+            except Exception:
+                pass
+            return ""
+
+        pb_val = safe_status(idx_pb)
+        pb_zk_val = safe_status(idx_pb_zk)
+        ar_val = safe_status(idx_ar)
+        eom_val = safe_status(idx_eom)
+
+        lines.append(f"Номер дела: {case_no}")
+        if date_fmt:
+            lines.append(f"Дата выезда: {date_fmt}")
+        if onzs_val:
+            lines.append(f"ОНзС: {onzs_val}")
+        if dev_val:
+            lines.append(f"Застройщик: {dev_val}")
+        if obj_val:
+            lines.append(f"Объект: {obj_val}")
+        if addr_val:
+            lines.append(f"Адрес: {addr_val}")
+
+        lines.append("")
+        lines.append(f"ПБ: {pb_val or '-'}")
+        lines.append(f"ПБ ЗК: {pb_zk_val or '-'}")
+        lines.append(f"АР/ММГН/АГО: {ar_val or '-'}")
+        lines.append(f"ЭОМ: {eom_val or '-'}")
+        lines.append("")
+        lines.append("────────────")
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -1115,7 +1467,10 @@ def onzs_menu_inline() -> InlineKeyboardMarkup:
 
 
 def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
-    col_case = get_col_by_letter(df, "I")
+    """
+    Список дел по ОНзС с количеством.
+    """
+    col_case = get_col_by_letter(df, "I") or get_col_by_letter(df, "H")
     col_onzs = get_col_by_letter(df, "E")
     col_addr = get_col_by_letter(df, "H")
 
@@ -1127,7 +1482,7 @@ def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
     if df_f.empty:
         return f"Нет объектов с ОНзС = {number}."
 
-    lines = [f"ОНзС = {number}", ""]
+    lines = [f"ОНзС = {number}", f"Найдено дел: {len(df_f)}", ""]
 
     for _, row in df_f.iterrows():
         case_no = str(row[col_case]).strip()
@@ -1325,7 +1680,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # ---------- ЗАМЕЧАНИЯ ----------
+    if data == "remarks_search_case":
+        context.user_data["awaiting_case_search"] = True
+        await query.message.reply_text(
+            "Введите номер дела (формат 00-00-000000), который нужно найти:"
+        )
+        return
+
+    if data == "remarks_onzs":
+        kb = onzs_menu_inline()
+        msg = (
+            "🏗 Раздел «ОНзС»\n\n"
+            "Выберите номер ОНзС, чтобы увидеть количество дел и список дел "
+            "из текущего файла замечаний.\n"
+            "Для выбранного ОНзС можно отдельно показать только неустранённые замечания."
+        )
+        await query.message.reply_text(msg, reply_markup=kb)
+        return
+
     if data == "remarks_not_done":
+        # общий список (кнопка больше не показывается, но оставим обработчик)
         await query.message.reply_text("Ищу строки со статусом «нет»...")
         df = get_remarks_df_current()
         if df is None:
@@ -1353,6 +1727,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         text = build_onzs_list_by_number(df, number)
         await send_long_text(query.message.chat, text)
+
+        # отдельное сообщение с кнопкой «Не устранены» по этому ОНзС
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"❌ Не устранены (ОНзС {number})",
+                        callback_data=f"onzs_not_done_{number}",
+                    )
+                ]
+            ]
+        )
+        await query.message.reply_text(
+            f"Для ОНзС {number} можно показать только строки, где статус «нет».",
+            reply_markup=kb,
+        )
+        return
+
+    if data.startswith("onzs_not_done_"):
+        number = data.replace("onzs_not_done_", "")
+        df = get_remarks_df_current()
+        if df is None:
+            await query.message.reply_text(
+                "Не удалось получить файл замечаний. Проверьте доступ к таблице."
+            )
+            return
+        text = build_remarks_not_done_by_onzs(df, number)
+        await send_long_text(query.message.chat, text)
         return
 
     # ---------- ИНСПЕКТОР ----------
@@ -1368,7 +1770,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "inspector_list":
         rows = fetch_inspector_visits(limit=50)
         text = build_inspector_list_text(rows)
-        await send_long_text(query.message.chat, text)
+        await send_long_text(query.message.chat, "\n".join(text.split("\n")))
         return
 
     if data == "inspector_download":
@@ -1391,7 +1793,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await inspector_process(update, context)
         return
 
-    # комментарий к "На доработку"
+    # ввод комментария к "На доработку"
     if context.user_data.get("awaiting_rework_comment"):
         info = context.user_data.pop("awaiting_rework_comment")
         version = info["version"]
@@ -1453,6 +1855,20 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Согласующие сохранены и уведомлены.")
         return
 
+    # режим поиска по номеру дела
+    if context.user_data.get("awaiting_case_search"):
+        context.user_data.pop("awaiting_case_search", None)
+        case_no = text.strip()
+        df = get_remarks_df_current()
+        if df is None:
+            await update.message.reply_text(
+                "Не удалось открыть файл замечаний. Проверьте доступ к таблице."
+            )
+            return
+        out_text = build_case_cards_text(df, case_no)
+        await send_long_text(chat, out_text)
+        return
+
     low = text.lower()
 
     # --------- Разделы главного меню ---------
@@ -1460,40 +1876,30 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settings = get_schedule_state()
         is_adm = is_admin(update.effective_user.id)
         msg = build_schedule_text(is_adm, settings)
-        kb = build_schedule_inline(is_adm, settings)
+        user_username = update.effective_user.username or ""
+        user_tag = f"@{user_username}" if user_username else None
+        kb = build_schedule_inline(is_adm, settings, user_tag=user_tag)
         msg_full = (
             "📅 Раздел «График выездов»\n\n"
             "• Смотреть текущий статус согласования\n"
             "• Обновить данные из общей таблицы\n"
-            "• Скачать красивый Excel-файл\n\n"
+            "• Скачать красиво оформленный Excel-файл\n\n"
+            "Если вы входите в список согласующих, ниже будут кнопки "
+            "«Согласовать» и «На доработку».\n\n"
             f"{msg}"
         )
         await update.message.reply_text(msg_full, reply_markup=kb)
-        return
-
-    if low == "📊 итоговая".lower():
-        await update.message.reply_text(
-            "Раздел «Итоговая» пока в упрощённом виде (список итоговых проверок планируется отдельно)."
-        )
         return
 
     if low == "📝 замечания".lower():
         kb = remarks_menu_inline()
         msg = (
             "📝 Раздел «Замечания»\n\n"
-            "• Показать строки, где статус «нет» (не устранены)\n"
-            "• Открыть файл с замечаниями и графиком\n\n"
+            "Здесь доступны:\n"
+            "• 🔎 поиск по номеру дела (показывает полную строку);\n"
+            "• 🏗 ОНзС — выбор 1–12, список дел и отдельный просмотр неустранённых;\n"
+            "• 📥 открыть общий файл таблицы.\n\n"
             "Выберите нужное действие:"
-        )
-        await update.message.reply_text(msg, reply_markup=kb)
-        return
-
-    if low == "🏗 онзс".lower():
-        kb = onzs_menu_inline()
-        msg = (
-            "🏗 Раздел «ОНзС»\n\n"
-            "Выберите номер ОНзС, чтобы увидеть объекты и номера дел "
-            "из текущего файла замечаний."
         )
         await update.message.reply_text(msg, reply_markup=kb)
         return
@@ -1583,9 +1989,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Добро пожаловать в бота отдела СОТ.\n\n"
         "Основные разделы:\n"
         "• 📅 График — согласование графика выездов\n"
-        "• 📝 Замечания — лист ПБ, АР, ММГН, АГО\n"
-        "• 📊 Итоговая — итоговые проверки\n"
-        "• 🏗 ОНзС — объекты по номерам ОНзС\n"
+        "• 📝 Замечания — поиск по номеру дела, ОНзС и статусы «нет»\n"
         "• Инспектор — выезды инспектора\n"
         "• 📈 Аналитика — история согласований\n\n"
         "Выберите раздел с помощью кнопок ниже."
@@ -1596,10 +2000,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "Справка по боту СОТ:\n\n"
-        "📅 График — показать статус согласования, скачать Excel.\n"
-        "📝 Замечания — искать не устранённые «нет» и открыть файл.\n"
-        "📊 Итоговая — список итоговых проверок (упрощённо).\n"
-        "🏗 ОНзС — объекты по каждому номеру ОНзС.\n"
+        "📅 График — показать статус согласования, обновить, скачать Excel.\n"
+        "📝 Замечания — поиск по номеру дела, работа с ОНзС и просмотр статусов «нет».\n"
         "Инспектор — добавление и выгрузка выездов инспектора.\n"
         "📈 Аналитика — история согласований по версиям графика.\n"
     )
