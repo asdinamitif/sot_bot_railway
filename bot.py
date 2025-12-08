@@ -231,6 +231,25 @@ def get_col_index_by_header(
     return None
 
 
+def normalize_onzs_value(val) -> Optional[str]:
+    """
+    Приводит значение ОНзС к строке без .0, пробелов и т.п.
+    6, 6.0, '6 ', '6.0'  -> '6'
+    """
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    # пробуем как число
+    try:
+        n = int(float(s.replace(",", ".")))
+        return str(n)
+    except Exception:
+        pass
+    return s
+
+
 # -------------------------------------------------
 # БАЗА ДАННЫХ (график + согласование + инспектор)
 # -------------------------------------------------
@@ -1066,15 +1085,17 @@ def build_remarks_not_done_by_onzs(df: pd.DataFrame, onzs_value: str) -> str:
 
     grouped = {}
 
+    num_str = normalize_onzs_value(onzs_value)
+
     for _, row in df.iterrows():
         # фильтрация по ОНзС
-        val_onzs = ""
         try:
-            val_onzs = str(row.iloc[onzs_idx]).strip()
+            val_raw = row.iloc[onzs_idx]
         except Exception:
-            pass
+            val_raw = None
 
-        if val_onzs != str(onzs_value).strip():
+        val_norm = normalize_onzs_value(val_raw)
+        if val_norm != num_str:
             continue
 
         case = ""
@@ -1368,7 +1389,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if step == "date":
         try:
-            form["date"] = datetime.strptime(text, "%d.%m.%Y").date()
+            form["date"] = datetime.strptime(text, "%d.%м.%Y").date()
             form["step"] = "area"
             context.user_data["inspector_form"] = form
             await update.message.reply_text("1/8. Площадь объекта (кв.м):")
@@ -1492,14 +1513,15 @@ def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
     # Адрес: «строительный адрес», по умолчанию H
     addr_idx = get_col_index_by_header(df, "строительный адрес", "H")
 
-    num_str = str(number).strip()
+    num_str = normalize_onzs_value(number)
     mask: List[bool] = []
     for _, row in df.iterrows():
         try:
-            val = str(row.iloc[onzs_idx]).strip()
+            val_raw = row.iloc[onzs_idx]
         except Exception:
-            val = ""
-        mask.append(val == num_str)
+            val_raw = None
+        val_norm = normalize_onzs_value(val_raw)
+        mask.append(val_norm == num_str)
 
     if not any(mask):
         return f"Нет объектов с ОНзС = {number}."
