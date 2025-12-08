@@ -231,6 +231,25 @@ def get_col_index_by_header(
     return None
 
 
+def normalize_onzs_value(val) -> Optional[str]:
+    """
+    Приводит значение ОНзС к строке без .0, пробелов и т.п.
+    6, 6.0, '6 ', '6.0'  -> '6'
+    """
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    # пробуем как число
+    try:
+        n = int(float(s.replace(",", ".")))
+        return str(n)
+    except Exception:
+        pass
+    return s
+
+
 # -------------------------------------------------
 # БАЗА ДАННЫХ (график + согласование + инспектор)
 # -------------------------------------------------
@@ -1066,15 +1085,17 @@ def build_remarks_not_done_by_onzs(df: pd.DataFrame, onzs_value: str) -> str:
 
     grouped = {}
 
+    num_str = normalize_onzs_value(onzs_value)
+
     for _, row in df.iterrows():
         # фильтрация по ОНзС
-        val_onzs = ""
         try:
-            val_onzs = str(row.iloc[onzs_idx]).strip()
+            val_raw = row.iloc[onzs_idx]
         except Exception:
-            pass
+            val_raw = None
 
-        if val_onzs != str(onzs_value).strip():
+        val_norm = normalize_onzs_value(val_raw)
+        if val_norm != num_str:
             continue
 
         case = ""
@@ -1316,7 +1337,7 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
 
         row = [
             "",
-            form.get("date").strftime("%d.%m.%Y") if form.get("date") else "",
+            form.get("date").strftime("%d.%м.%Y") if form.get("date") else "",
             "",
             d_value,
             form.get("onzs", ""),
@@ -1492,14 +1513,15 @@ def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
     # Адрес: «строительный адрес», по умолчанию H
     addr_idx = get_col_index_by_header(df, "строительный адрес", "H")
 
-    num_str = str(number).strip()
+    num_str = normalize_onzs_value(number)
     mask: List[bool] = []
     for _, row in df.iterrows():
         try:
-            val = str(row.iloc[onzs_idx]).strip()
+            val_raw = row.iloc[onzs_idx]
         except Exception:
-            val = ""
-        mask.append(val == num_str)
+            val_raw = None
+        val_norm = normalize_onzs_value(val_raw)
+        mask.append(val_norm == num_str)
 
     if not any(mask):
         return f"Нет объектов с ОНзС = {number}."
@@ -1520,7 +1542,7 @@ def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
         case_no = safe(case_idx)
         addr = safe(addr_idx)
 
-        if case_no and addr:
+        if case_no и addr:
             lines.append(f"• {case_no} — {addr}")
         elif case_no:
             lines.append(f"• {case_no}")
@@ -1574,7 +1596,7 @@ async def send_inspector_xlsx(
     for r in rows:
         d = r["date"] or ""
         try:
-            d_fmt = datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y")
+            d_fmt = datetime.strptime(d, "%Y-%m-%d").strftime("%d.%м.%Y")
         except Exception:
             d_fmt = d
         data.append(
@@ -1598,7 +1620,7 @@ async def send_inspector_xlsx(
         df.to_excel(writer, sheet_name="Инспектор", index=False)
 
     bio.seek(0)
-    filename = f"Инспектор_выезды_{date.today().strftime('%d.%m.%Y')}.xlsx"
+    filename = f"Инспектор_выезды_{date.today().strftime('%d.%м.%Y')}.xlsx"
 
     await context.bot.send_document(
         chat_id=chat_id,
@@ -1680,7 +1702,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             approvals = get_schedule_approvals(version)
-            if approvals and all(r["status"] == "approved" for r in approvals):
+            if approvals и all(r["status"] == "approved" for r in approvals):
                 header = build_schedule_header(version, approvals)
                 lines = [header, "", "Согласовано всеми:"]
                 for r in approvals:
