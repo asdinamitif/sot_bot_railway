@@ -67,7 +67,6 @@ _default_sheet_id = _extract_spreadsheet_id_from_url(SCHEDULE_URL_ENV)
 if not _default_sheet_id:
     _default_sheet_id = (os.getenv("GSHEETS_SPREADSHEET_ID") or "").strip()
 if not _default_sheet_id:
-    # запасной ID, чтобы код не упал
     _default_sheet_id = "1W_9Cs-LaX6KR4cE9xN71CliE6Lm_TyQqk8t3kQa4FCc"
 
 GSHEETS_SPREADSHEET_ID = _default_sheet_id
@@ -455,6 +454,17 @@ def fetch_inspector_visits(limit: int = 50) -> List[sqlite3.Row]:
     return rows
 
 
+def clear_inspector_visits() -> None:
+    """
+    Полностью очищает локную таблицу выездов инспектора.
+    """
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("DELETE FROM inspector_visits")
+    conn.commit()
+    conn.close()
+
+
 # -------------------------------------------------
 # Клавиатуры
 # -------------------------------------------------
@@ -539,6 +549,11 @@ def inspector_menu_inline() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "📥 Скачать Excel", callback_data="inspector_download"
                 ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔄 Обновить", callback_data="inspector_reset"
+                )
             ],
         ]
     )
@@ -1016,7 +1031,7 @@ def build_remarks_not_done_by_onzs(df: pd.DataFrame, onzs_value: str) -> str:
     sheet_name = get_current_remarks_sheet_name()
 
     # Столбец ОНзС
-    onzs_idx = get_col_index_by_header(df, "онзс", "E")
+    onzs_idx = get_col_index_by_header(df, "онзс", "D")
     if onzs_idx is None:
         return "Не удалось определить столбец ОНзС в файле замечаний."
 
@@ -1141,14 +1156,13 @@ def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
     # Индексы основных столбцов
     idx_case = get_col_index_by_header(df, "номер дела", "I")
     if idx_case is None:
-        # запасной вариант (если всё сдвинуто)
         idx_case = get_col_index_by_header(df, "номер дела", "H")
 
     if idx_case is None:
         return "Не удалось определить столбец «Номер дела» в файле замечаний."
 
     idx_date = get_col_index_by_header(df, "дата выезда", "B")
-    idx_onzs = get_col_index_by_header(df, "онзс", "E")
+    idx_onzs = get_col_index_by_header(df, "онзс", "D")
     idx_dev = get_col_index_by_header(df, "наименование застройщика", "F")
     idx_obj = get_col_index_by_header(df, "наименование объекта", "G")
     idx_addr = get_col_index_by_header(df, "строительный адрес", "H")
@@ -1158,8 +1172,8 @@ def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
     idx_ar = excel_col_to_index("X")
     idx_eom = excel_col_to_index("AD")
 
-    # фильтрация по номеру дела
-    mask = []
+    # фильтрация по номеру дела (маска по строкам)
+    mask: List[bool] = []
     for _, row in df.iterrows():
         try:
             val = str(row.iloc[idx_case]).strip()
@@ -1170,7 +1184,7 @@ def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
     if not any(mask):
         return f"По номеру дела {case_no} ничего не найдено.\nЛист: {sheet_name}"
 
-    df_sel = df[[m for m in mask]]
+    df_sel = df[mask]
 
     lines: List[str] = [
         f"Результаты поиска по номеру дела: {case_no}",
@@ -1190,7 +1204,6 @@ def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
 
         date_raw = safe(idx_date)
         date_fmt = date_raw
-        # Попробуем привести к дате
         try:
             if date_raw:
                 dt = pd.to_datetime(date_raw, dayfirst=True, errors="ignore")
@@ -1293,7 +1306,6 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
         return False
 
     try:
-        # Оформляем как в вашей таблице: две строки в одной ячейке
         area_str = str(form.get("area", "")).replace(".", ",")
         floors_str = str(form.get("floors", ""))
 
@@ -1346,11 +1358,10 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     form = context.user_data.get("inspector_form", {}) or {}
     step = form.get("step")
 
-    # если step потерялся – перезапускаем мастер
     if not step:
         context.user_data["inspector_form"] = {"step": "date"}
         await update.message.reply_text(
-            "👮‍♂️ Новый выезд инспектора\n\n"
+            "👮‍♂️ Выезд инспектора\n\n"
             "1/8. Дата выезда (ДД.ММ.ГГГГ):"
         )
         return
@@ -1469,28 +1480,52 @@ def onzs_menu_inline() -> InlineKeyboardMarkup:
 def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
     """
     Список дел по ОНзС с количеством.
+    Ищем столбцы по заголовкам, без жёсткой привязки к буквам.
     """
-    col_case = get_col_by_letter(df, "I") or get_col_by_letter(df, "H")
-    col_onzs = get_col_by_letter(df, "E")
-    col_addr = get_col_by_letter(df, "H")
+    # ОНзС обычно в столбце D, но ищем по заголовку
+    onzs_idx = get_col_index_by_header(df, "онзс", "D")
+    if onzs_idx is None:
+        return "Не удалось определить столбец ОНзС в файле замечаний."
 
-    if not col_case or not col_onzs:
-        return "Не удалось определить структуру файла."
+    # Номер дела: заголовок содержит «номер дела», по умолчанию H
+    case_idx = get_col_index_by_header(df, "номер дела", "H")
+    # Адрес: «строительный адрес», по умолчанию H
+    addr_idx = get_col_index_by_header(df, "строительный адрес", "H")
 
-    df_f = df[df[col_onzs].astype(str).str.strip() == str(number).strip()]
+    num_str = str(number).strip()
+    mask: List[bool] = []
+    for _, row in df.iterrows():
+        try:
+            val = str(row.iloc[onzs_idx]).strip()
+        except Exception:
+            val = ""
+        mask.append(val == num_str)
 
-    if df_f.empty:
+    if not any(mask):
         return f"Нет объектов с ОНзС = {number}."
+
+    df_f = df[mask]
 
     lines = [f"ОНзС = {number}", f"Найдено дел: {len(df_f)}", ""]
 
     for _, row in df_f.iterrows():
-        case_no = str(row[col_case]).strip()
-        addr = str(row[col_addr]).strip() if col_addr else ""
-        if addr:
+        def safe(idx: Optional[int]) -> str:
+            if idx is None:
+                return ""
+            try:
+                return str(row.iloc[idx]).strip()
+            except Exception:
+                return ""
+
+        case_no = safe(case_idx)
+        addr = safe(addr_idx)
+
+        if case_no and addr:
             lines.append(f"• {case_no} — {addr}")
-        else:
+        elif case_no:
             lines.append(f"• {case_no}")
+        elif addr:
+            lines.append(f"• {addr}")
 
     return "\n".join(lines)
 
@@ -1699,7 +1734,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "remarks_not_done":
-        # общий список (кнопка больше не показывается, но оставим обработчик)
         await query.message.reply_text("Ищу строки со статусом «нет»...")
         df = get_remarks_df_current()
         if df is None:
@@ -1728,7 +1762,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = build_onzs_list_by_number(df, number)
         await send_long_text(query.message.chat, text)
 
-        # отдельное сообщение с кнопкой «Не устранены» по этому ОНзС
         kb = InlineKeyboardMarkup(
             [
                 [
@@ -1761,7 +1794,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "inspector_add":
         context.user_data["inspector_form"] = {"step": "date"}
         await query.message.reply_text(
-            "👮‍♂️ Новый выезд инспектора\n\n"
+            "👮‍♂️ Выезд инспектора\n\n"
             "Укажем данные по шагам.\n"
             "1/8. Дата выезда (ДД.ММ.ГГГГ):"
         )
@@ -1777,6 +1810,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = fetch_inspector_visits(limit=1000)
         await send_inspector_xlsx(
             chat_id=query.message.chat.id, rows=rows, context=context
+        )
+        return
+
+    if data == "inspector_reset":
+        clear_inspector_visits()
+        await query.message.reply_text(
+            "Список выездов инспектора очищен.\n"
+            "Новые выезды будут попадать в Excel после добавления через кнопку «➕ Добавить выезд»."
         )
         return
 
@@ -1811,7 +1852,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         version = info["version"]
 
         raw = text.replace(",", " ").split()
-        approvers = []
+        approvers: List[str] = []
         for token in raw:
             token = token.strip()
             if not token:
@@ -1851,7 +1892,26 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         )
 
-        await chat.send_message("\n".join(lines), reply_markup=kb)
+        text_to_send = "\n".join(lines)
+
+        # 1) сообщение в чат, где админ вводил список
+        await chat.send_message(text_to_send, reply_markup=kb)
+
+        # 2) дублирование в группу/канал, если задан SCHEDULE_NOTIFY_CHAT_ID
+        if SCHEDULE_NOTIFY_CHAT_ID is not None:
+            try:
+                await context.bot.send_message(
+                    chat_id=SCHEDULE_NOTIFY_CHAT_ID,
+                    text=text_to_send,
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                log.error(
+                    "Не удалось отправить уведомление в чат SCHEDULE_NOTIFY_CHAT_ID=%s: %s",
+                    SCHEDULE_NOTIFY_CHAT_ID,
+                    e,
+                )
+
         await update.message.reply_text("Согласующие сохранены и уведомлены.")
         return
 
@@ -1909,9 +1969,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = (
             "👮‍♂️ Раздел «Инспектор»\n\n"
             "Здесь можно:\n"
-            "• ➕ добавить новый выезд;\n"
+            "• ➕ добавить выезд инспектора;\n"
             "• 📋 посмотреть последние выезды;\n"
-            "• 📥 скачать отдельный Excel с выездами.\n\n"
+            "• 📥 скачать отдельный Excel с выездами;\n"
+            "• 🔄 обнулить список выездов (кнопка «Обновить»).\n\n"
             "Выберите действие кнопками ниже."
         )
         await update.message.reply_text(msg, reply_markup=kb)
