@@ -1400,6 +1400,7 @@ def _parse_final_date(val) -> Optional[date]:
         return None
     return None
 
+
 def filter_final_checks_df(
     df: pd.DataFrame,
     start_date: Optional[date] = None,
@@ -1407,6 +1408,11 @@ def filter_final_checks_df(
     case_no: Optional[str] = None,
     basis: str = "any",  # "start" -> только O, "end" -> только P, "any" -> O или P
 ) -> pd.DataFrame:
+    """
+    Универсальная фильтрация итоговых проверок:
+    - по номеру дела (столбец B),
+    - по периоду дат по выбранной базе: O (дата начала) или P (дата окончания).
+    """
     idx_case = excel_col_to_index("B")
     idx_start = excel_col_to_index("O")
     idx_end = excel_col_to_index("P")
@@ -1415,53 +1421,53 @@ def filter_final_checks_df(
     if basis not in ("start", "end", "any"):
         basis = "any"
 
-    case_filter_norm = normalize_case_number(case_no) if case_no else None
+    df2 = df.copy()
 
-    mask: List[bool] = []
-    for _, row in df.iterrows():
-        include = True
+    # --- базовая маска: все строки включены ---
+    mask = pd.Series(True, index=df2.index)
 
-        # --- фильтр по номеру дела ---
+    # --- фильтр по номеру дела ---
+    if case_no:
+        case_filter_norm = normalize_case_number(case_no)
         if case_filter_norm:
-            try:
-                case_val = row.iloc[idx_case]
-            except Exception:
-                case_val = None
-            val_norm = normalize_case_number(case_val)
-            if not val_norm or val_norm != case_filter_norm:
-                include = False
+            case_vals = []
+            for _, row in df2.iterrows():
+                try:
+                    raw = row.iloc[idx_case]
+                except Exception:
+                    raw = None
+                val_norm = normalize_case_number(raw)
+                case_vals.append(val_norm == case_filter_norm)
+            mask &= pd.Series(case_vals, index=df2.index)
 
-        # --- фильтр по периоду ---
-        if include and start_date and end_date:
-            try:
-                s_raw = row.iloc[idx_start]
-            except Exception:
-                s_raw = None
-            try:
-                e_raw = row.iloc[idx_end]
-            except Exception:
-                e_raw = None
+    # --- подготовка базовой даты по столбцам O/P ---
+    s_start_raw = df2.iloc[:, idx_start] if 0 <= idx_start < df2.shape[1] else pd.Series(index=df2.index, dtype="object")
+    s_end_raw = df2.iloc[:, idx_end] if 0 <= idx_end < df2.shape[1] else pd.Series(index=df2.index, dtype="object")
 
-            d_start = _parse_final_date(s_raw)
-            d_end = _parse_final_date(e_raw)
+    s_start = pd.to_datetime(s_start_raw, dayfirst=True, errors="coerce")
+    s_end = pd.to_datetime(s_end_raw, dayfirst=True, errors="coerce")
 
-            if basis == "start":
-                base = d_start
-            elif basis == "end":
-                base = d_end
-            else:  # "any"
-                base = d_start or d_end
+    if basis == "start":
+        base = s_start
+    elif basis == "end":
+        base = s_end
+    else:  # "any"
+        base = s_start.combine_first(s_end)
 
-            if base is None or base < start_date or base > end_date:
-                include = False
+    # --- фильтр по периоду ---
+    if start_date and end_date:
+        start_ts = pd.Timestamp(start_date)
+        end_ts = pd.Timestamp(end_date)
+        between_mask = base.notna() & (base >= start_ts) & (base <= end_ts)
+        mask &= between_mask
 
-        mask.append(include)
+    # --- итоговый датафрейм ---
+    if not len(df2.index):
+        return df2.iloc[0:0].copy()
 
-    if not mask:
-        return df.iloc[0:0].copy()
-
-    df_f = df[mask].copy().reset_index(drop=True)
+    df_f = df2[mask].copy().reset_index(drop=True)
     return df_f
+
 
 
 def build_final_checks_text_filtered(
