@@ -1543,6 +1543,50 @@ def filter_final_checks_df(
     return result.reset_index(drop=True)
 
 
+
+def compute_auto_period_for_final(df: pd.DataFrame, basis: str, mode: str) -> Optional[tuple[date, date]]:
+    """Определяет автоматически период для итоговых проверок.
+
+    basis:
+        'start' — использовать столбец O (дата начала итоговой проверки)
+        'end'   — использовать столбец P (дата окончания итоговой проверки)
+
+    mode:
+        'week'  — последние 7 дней от максимальной даты
+        'month' — последние 30 дней от максимальной даты
+    """
+    if df is None or df.empty:
+        return None
+
+    basis = (basis or "start").lower()
+    if basis not in ("start", "end"):
+        basis = "start"
+
+    # Выбираем нужный столбец (O или P)
+    idx_col = excel_col_to_index("O" if basis == "start" else "P")
+    if not (0 <= idx_col < len(df.columns)):
+        return None
+
+    try:
+        ser_raw = df.iloc[:, idx_col]
+    except Exception:
+        return None
+
+    # Приводим значения к датам
+    dates = ser_raw.apply(_parse_final_date).dropna()
+    if dates.empty:
+        return None
+
+    last_date = max(dates)
+    if mode == "week":
+        start = last_date - timedelta(days=7)
+    else:
+        # по умолчанию считаем месяц как 30 дней
+        start = last_date - timedelta(days=30)
+    end = last_date
+    return start, end
+
+
 def build_final_checks_text_filtered(
     df: pd.DataFrame,
     start_date: Optional[date] = None,
@@ -2306,14 +2350,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data.pop("final_range_choice", None)
                 return
 
-            today = local_now().date()
+            period = compute_auto_period_for_final(df, basis=basis, mode=mode)
+            if not period:
+                await query.message.reply_text(
+                    "В таблице итоговых проверок нет корректных дат в выбранном столбце (O или P)."
+                )
+                context.user_data.pop("final_range_choice", None)
+                return
+
+            start, end = period
             if mode == "week":
-                start = today - timedelta(days=7)
-                end = today
                 mode_text = "за неделю"
             else:
-                start = today - timedelta(days=30)
-                end = today
                 mode_text = "за месяц"
 
             basis_text = (
