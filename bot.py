@@ -1434,81 +1434,43 @@ def _parse_final_date(val) -> Optional[date]:
     """
     Преобразует значение из столбцов O/P в дату.
     Поддерживает текстовые и «экселевские» даты.
+    Всегда возвращает обычный объект date или None,
+    никогда не возвращает pandas.NaT.
     """
     if val is None:
         return None
+
+    # Явно отбрасываем NaT/NaN
     try:
+        if pd.isna(val):
+            return None
+    except TypeError:
+        # для скаляров, где pd.isna не применим
+        pass
+
+    try:
+        # Уже готовый datetime/pandas.Timestamp (включая NaT)
         if isinstance(val, (datetime, pd.Timestamp)):
+            if pd.isna(val):
+                return None
             return val.date()
-        if isinstance(val, (int, float)) and not pd.isna(val):
+
+        # Числовые "экселевские" даты
+        if isinstance(val, (int, float)):
+            if pd.isna(val):
+                return None
             dt = pd.to_datetime(val, errors="coerce")
-            if isinstance(dt, (datetime, pd.Timestamp)):
+            if isinstance(dt, (datetime, pd.Timestamp)) and not pd.isna(dt):
                 return dt.date()
+
+        # Текстовые даты
         dt = pd.to_datetime(str(val), dayfirst=True, errors="coerce")
-        if isinstance(dt, (datetime, pd.Timestamp)):
+        if isinstance(dt, (datetime, pd.Timestamp)) and not pd.isna(dt):
             return dt.date()
     except Exception:
         return None
+
     return None
-
-
-
-def compute_auto_period_for_final(
-    df: pd.DataFrame,
-    days: int,
-    basis: str = "any",
-) -> Optional[tuple[date, date]]:
-    """
-    Автоматически определяет период длиной `days` дней для итоговых проверок.
-
-    Логика:
-    • собираем даты из столбцов O (начало) и P (окончание);
-    • в зависимости от basis берём:
-        - "start"  -> только даты из O;
-        - "end"    -> только даты из P;
-        - "any"    -> O или P (если O пустая, используем P);
-    • находим максимальную дату и берём интервал [max_date - (days-1), max_date].
-
-    Если подходящих дат нет — возвращаем None.
-    """
-    idx_start = excel_col_to_index("O")
-    idx_end = excel_col_to_index("P")
-
-    basis = (basis or "any").lower()
-    if basis not in ("start", "end", "any"):
-        basis = "any"
-
-    dates: List[date] = []
-
-    for _, row in df.iterrows():
-        try:
-            s_raw = row.iloc[idx_start]
-        except Exception:
-            s_raw = None
-        try:
-            e_raw = row.iloc[idx_end]
-        except Exception:
-            e_raw = None
-
-        d_start = _parse_final_date(s_raw)
-        d_end = _parse_final_date(e_raw)
-
-        if basis == "start":
-            base = d_start
-        elif basis == "end":
-            base = d_end
-        else:  # "any"
-            base = d_start or d_end
-
-        if isinstance(base, date):
-            dates.append(base)
-
-    if not dates:
-        return None
-
-    max_date = max(dates)
-    start_date = max_date - timedelta(days=days - 1)
-    return start_date, max_date
 
 
 def filter_final_checks_df(
@@ -2338,21 +2300,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data.pop("final_range_choice", None)
                 return
 
+            today = local_now().date()
             if mode == "week":
-                auto = compute_auto_period_for_final(df, days=7, basis=basis)
+                start = today - timedelta(days=7)
+                end = today
                 mode_text = "за неделю"
             else:
-                auto = compute_auto_period_for_final(df, days=30, basis=basis)
+                start = today - timedelta(days=30)
+                end = today
                 mode_text = "за месяц"
-
-            if not auto:
-                await query.message.reply_text(
-                    "В таблице итоговых проверок нет корректных дат в столбцах O/P."
-                )
-                context.user_data.pop("final_range_choice", None)
-                return
-
-            start, end = auto
 
             basis_text = (
                 "по дате начала (O)" if basis == "start" else "по дате окончания (P)"
