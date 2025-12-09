@@ -109,6 +109,8 @@ FINAL_CHECKS_SPREADSHEET_ID = (
     ).strip()
 )
 
+FINAL_CHECKS_LOCAL_PATH = os.getenv("FINAL_CHECKS_LOCAL_PATH", "final_checks.xlsx")
+
 
 def is_admin(uid: int) -> bool:
     return uid in HARD_CODED_ADMINS
@@ -1331,15 +1333,15 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
 # Итоговые проверки: чтение, фильтр, текст, Excel
 # -------------------------------------------------
 
-def get_final_checks_df() -> Optional[pd.DataFrame]:
+def refresh_final_checks_local_file() -> bool:
     """
-    Читает файл итоговых проверок из отдельной таблицы FINAL_CHECKS_SPREADSHEET_ID.
-    Собирает данные со всех листов книги и склеивает в один DataFrame.
+    Скачивает актуальную таблицу итоговых проверок в локальный файл FINAL_CHECKS_LOCAL_PATH.
+    Старую версию файла при наличии удаляет.
     """
     sheet_id = FINAL_CHECKS_SPREADSHEET_ID
     if not sheet_id:
         log.error("FINAL_CHECKS_SPREADSHEET_ID не задан.")
-        return None
+        return False
 
     url = build_export_url(sheet_id)
 
@@ -1348,10 +1350,42 @@ def get_final_checks_df() -> Optional[pd.DataFrame]:
         resp.raise_for_status()
     except Exception as e:
         log.error("Ошибка скачивания Excel (итоговые проверки): %s", e)
-        return None
+        return False
 
     try:
-        xls = pd.ExcelFile(BytesIO(resp.content))
+        # удаляем старый файл, если есть
+        try:
+            os.remove(FINAL_CHECKS_LOCAL_PATH)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log.warning("Не удалось удалить старый файл итоговых проверок: %s", e)
+
+        with open(FINAL_CHECKS_LOCAL_PATH, "wb") as f:
+            f.write(resp.content)
+        log.info("Файл итоговых проверок обновлён: %s", FINAL_CHECKS_LOCAL_PATH)
+        return True
+    except Exception as e:
+        log.error("Ошибка сохранения файла итоговых проверок: %s", e)
+        return False
+
+
+def get_final_checks_df() -> Optional[pd.DataFrame]:
+    """
+    Читает локальный файл итоговых проверок FINAL_CHECKS_LOCAL_PATH,
+    который обновляется при входе в раздел «Итоговые проверки».
+    Собирает данные со всех листов книги и склеивает в один DataFrame.
+    """
+    # если файла нет, пробуем скачать
+    if not os.path.exists(FINAL_CHECKS_LOCAL_PATH):
+        log.warning(
+            "Локальный файл итоговых проверок не найден, пробуем скачать заново."
+        )
+        if not refresh_final_checks_local_file():
+            return None
+
+    try:
+        xls = pd.ExcelFile(FINAL_CHECKS_LOCAL_PATH)
         if not xls.sheet_names:
             log.error("Файл итоговых проверок пуст (нет листов).")
             return None
@@ -1379,11 +1413,20 @@ def get_final_checks_df() -> Optional[pd.DataFrame]:
         df_all = df_all.reset_index(drop=True)
         return df_all
     except Exception as e:
-        log.error("Ошибка обработки файла итоговых проверок: %s", e)
+        log.error("Ошибка чтения локального файла итоговых проверок: %s", e)
         return None
 
 
-   return val.date()
+(val) -> Optional[date]:
+    """
+    Преобразует значение из столбцов O/P в дату.
+    Поддерживает текстовые и «экселевские» даты.
+    """
+    if val is None:
+        return None
+    try:
+        if isinstance(val, (datetime, pd.Timestamp)):
+            return val.date()
         if isinstance(val, (int, float)) and not pd.isna(val):
             dt = pd.to_datetime(val, errors="coerce")
             if isinstance(dt, (datetime, pd.Timestamp)):
@@ -2610,7 +2653,17 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_text(chat, "\n".join(lines))
         return
 
+
     if low == "итоговые проверки":
+        # каждый заход в раздел «Итоговые проверки» обновляем локальный файл
+        ok = refresh_final_checks_local_file()
+        if not ok:
+            await update.message.reply_text(
+                "Не удалось обновить файл итоговых проверок. "
+                "Проверьте доступ к таблице или попробуйте позже."
+            )
+            return
+
         kb = final_checks_menu_inline()
         msg = (
             "📋 Раздел «Итоговые проверки»\n\n"
@@ -2623,6 +2676,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(msg, reply_markup=kb)
         return
+
 
     await update.message.reply_text(
         "Я вас не понял. Выберите пункт меню или нажмите /start.",
