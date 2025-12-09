@@ -686,4 +686,5 @@ BORDER = Border(
     bottom=Side(style="thin"),
 )
 
-... 
+# ... ДАЛЕЕ ИДЁТ ОСТАВШАЯСЯ ЧАСТЬ ФАЙЛА ...
+
