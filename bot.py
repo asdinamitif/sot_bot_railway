@@ -101,6 +101,14 @@ SCHEDULE_NOTIFY_CHAT_ID = (
     int(SCHEDULE_NOTIFY_CHAT_ID_ENV) if SCHEDULE_NOTIFY_CHAT_ID_ENV else None
 )
 
+# ВТОРАЯ ТАБЛИЦА — итоговые проверки
+FINAL_CHECKS_SPREADSHEET_ID = (
+    os.getenv(
+        "FINAL_CHECKS_SPREADSHEET_ID",
+        "1dUO3neTKzKI3D8P6fs_LJLmWlL7jw-FhohtJkjz4KuE",
+    ).strip()
+)
+
 
 def is_admin(uid: int) -> bool:
     return uid in HARD_CODED_ADMINS
@@ -251,11 +259,6 @@ def normalize_case_number(val) -> str:
 
 
 def get_case_col_index(df: pd.DataFrame) -> Optional[int]:
-    """
-    Всегда стараемся брать «Номер дела (I)»:
-    - сначала жёстко берём колонку I по индексу;
-    - если по какой-то причине её нет, пробуем искать по заголовку.
-    """
     idx_i = excel_col_to_index("I")
     if 0 <= idx_i < len(df.columns):
         return idx_i
@@ -497,6 +500,7 @@ def main_menu() -> ReplyKeyboardMarkup:
         [
             ["📅 График", "📝 Замечания"],
             ["Инспектор", "📈 Аналитика"],
+            ["Итоговые проверки"],
         ],
         resize_keyboard=True,
     )
@@ -1281,6 +1285,115 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
 
 
 # -------------------------------------------------
+# Итоговые проверки: чтение и текст
+# -------------------------------------------------
+def get_final_checks_df() -> Optional[pd.DataFrame]:
+    """
+    Читает файл итоговых проверок из отдельной таблицы FINAL_CHECKS_SPREADSHEET_ID.
+    Берём первый лист книги.
+    """
+    sheet_id = FINAL_CHECKS_SPREADSHEET_ID
+    if not sheet_id:
+        log.error("FINAL_CHECKS_SPREADSHEET_ID не задан.")
+        return None
+
+    url = build_export_url(sheet_id)
+
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        log.error("Ошибка скачивания Excel (итоговые проверки): %s", e)
+        return None
+
+    try:
+        xls = pd.ExcelFile(BytesIO(resp.content))
+        if not xls.sheet_names:
+            log.error("Файл итоговых проверок пуст (нет листов).")
+            return None
+        sheet_name = xls.sheet_names[0]
+        df = pd.read_excel(xls, sheet_name=sheet_name)
+        df = df.dropna(how="all").reset_index(drop=True)
+        return df
+    except Exception as e:
+        log.error("Ошибка чтения листа итоговых проверок: %s", e)
+        return None
+
+
+def build_final_checks_text(df: pd.DataFrame) -> str:
+    """
+    Формирует список итоговых проверок:
+    1) Номер дела (B)
+    2) Наименование объекта (D)
+    3) Адрес объекта (E)
+    4) Дата начала (O)
+    5) Дата окончания (P)
+    """
+    idx_case = excel_col_to_index("B")
+    idx_obj = excel_col_to_index("D")
+    idx_addr = excel_col_to_index("E")
+    idx_start = excel_col_to_index("O")
+    idx_end = excel_col_to_index("P")
+
+    lines: List[str] = ["📋 Итоговые проверки", ""]
+
+    for _, row in df.iterrows():
+
+        def safe(idx: int) -> str:
+            try:
+                val = row.iloc[idx]
+            except Exception:
+                return ""
+            if pd.isna(val):
+                return ""
+            return str(val).strip()
+
+        case_no = safe(idx_case)
+        if not case_no:
+            continue
+
+        obj = safe(idx_obj)
+        addr = safe(idx_addr)
+        d_start_raw = safe(idx_start)
+        d_end_raw = safe(idx_end)
+
+        def fmt_date(val: str) -> str:
+            if not val:
+                return ""
+            try:
+                dt = pd.to_datetime(val, dayfirst=True, errors="ignore")
+                if isinstance(dt, (datetime, pd.Timestamp)):
+                    return dt.strftime("%d.%m.%Y")
+            except Exception:
+                pass
+            return val
+
+        d_start = fmt_date(d_start_raw)
+        d_end = fmt_date(d_end_raw)
+
+        lines.append(f"Номер дела: {case_no}")
+        if obj:
+            lines.append(f"Объект: {obj}")
+        if addr:
+            lines.append(f"Адрес: {addr}")
+        if d_start or d_end:
+            if d_start and d_end:
+                lines.append(f"Период итоговой проверки: {d_start} — {d_end}")
+            elif d_start:
+                lines.append(f"Дата начала итоговой проверки: {d_start}")
+            else:
+                lines.append(f"Дата окончания итоговой проверки: {d_end}")
+        lines.append("")
+        lines.append("────────────")
+        lines.append("")
+
+    if len(lines) <= 2:
+        return "В таблице итоговых проверок нет строк с заполненным номером дела (B)."
+
+    return "\n".join(lines)
+
+
+# -------------------------------------------------
 # Инспектор → Google Sheets
 # -------------------------------------------------
 def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
@@ -1300,7 +1413,7 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
 
         row = [
             "",
-            form.get("date").strftime("%d.%m.%Y") if form.get("date") else "",
+            form.get("date").strftime("%d.%м.%Y") if form.get("date") else "",
             "",
             d_value,
             form.get("onzs", ""),
@@ -2005,6 +2118,18 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_text(chat, "\n".join(lines))
         return
 
+    if low == "итоговые проверки":
+        df = get_final_checks_df()
+        if df is None:
+            await update.message.reply_text(
+                "Не удалось открыть таблицу итоговых проверок. "
+                "Проверьте доступ к второй Google-таблице."
+            )
+            return
+        text_out = build_final_checks_text(df)
+        await send_long_text(chat, text_out)
+        return
+
     await update.message.reply_text(
         "Я вас не понял. Выберите пункт меню или нажмите /start.",
         reply_markup=main_menu(),
@@ -2030,6 +2155,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 📅 График — согласование графика выездов\n"
         "• 📝 Замечания — поиск по номеру дела, ОНзС и статусы «нет»\n"
         "• Инспектор — выезды инспектора\n"
+        "• Итоговые проверки — перечень итоговых проверок по отдельной таблице\n"
         "• 📈 Аналитика — история согласований\n\n"
         "Выберите раздел с помощью кнопок ниже."
     )
@@ -2042,6 +2168,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📅 График — показать статус согласования, обновить, скачать Excel.\n"
         "📝 Замечания — поиск по номеру дела (I), работа с ОНзС и просмотр статусов «нет».\n"
         "Инспектор — добавление и выгрузка выездов инспектора.\n"
+        "Итоговые проверки — список итоговых проверок из отдельной Google-таблицы.\n"
         "📈 Аналитика — история согласований по версиям графика.\n"
     )
     await update.message.reply_text(msg, reply_markup=main_menu())
