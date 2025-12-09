@@ -1417,7 +1417,8 @@ def get_final_checks_df() -> Optional[pd.DataFrame]:
         return None
 
 
-(val) -> Optional[date]:
+
+def _parse_final_date(val) -> Optional[date]:
     """
     Преобразует значение из столбцов O/P в дату.
     Поддерживает текстовые и «экселевские» даты.
@@ -2653,8 +2654,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_text(chat, "\n".join(lines))
         return
 
-
-    if low == "итоговые проверки":
+    
+if low == "итоговые проверки":
         # каждый заход в раздел «Итоговые проверки» обновляем локальный файл
         ok = refresh_final_checks_local_file()
         if not ok:
@@ -2677,9 +2678,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, reply_markup=kb)
         return
 
-
-    await update.message.reply_text(
-        "Я вас не понял. Выберите пункт меню или нажмите /start.",
+ыберите пункт меню или нажмите /start.",
         reply_markup=main_menu(),
     )
 
