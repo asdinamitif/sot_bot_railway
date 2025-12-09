@@ -1333,9 +1333,8 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
 
 def get_final_checks_df() -> Optional[pd.DataFrame]:
     """
-    Читает файл итоговых проверок из таблицы FINAL_CHECKS_SPREADSHEET_ID.
-    Собирает данные со всех листов книги и склеивает их в один DataFrame.
-    В каждый лист добавляется служебный столбец "__Лист" с названием листа.
+    Читает файл итоговых проверок из отдельной таблицы FINAL_CHECKS_SPREADSHEET_ID.
+    Собирает данные со всех листов книги и склеивает в один DataFrame.
     """
     sheet_id = FINAL_CHECKS_SPREADSHEET_ID
     if not sheet_id:
@@ -1357,45 +1356,34 @@ def get_final_checks_df() -> Optional[pd.DataFrame]:
             log.error("Файл итоговых проверок пуст (нет листов).")
             return None
 
-        frames: List[pd.DataFrame] = []
+        dfs: List[pd.DataFrame] = []
         for sheet_name in xls.sheet_names:
             try:
                 df_sheet = pd.read_excel(xls, sheet_name=sheet_name)
-                df_sheet = df_sheet.dropna(how="all").reset_index(drop=True)
+                df_sheet = df_sheet.dropna(how="all")
                 if df_sheet.empty:
                     continue
-                # добавляем название листа, чтобы при необходимости можно было понять источник строки
-                df_sheet["__Лист"] = sheet_name
-                frames.append(df_sheet)
-            except Exception as e_sheet:
+                dfs.append(df_sheet)
+            except Exception as e:
                 log.error(
                     "Ошибка чтения листа итоговых проверок '%s': %s",
                     sheet_name,
-                    e_sheet,
+                    e,
                 )
-                continue
 
-        if not frames:
-            log.error("Не удалось прочитать ни одного листа итоговых проверок.")
+        if not dfs:
+            log.error("Не удалось прочитать ни один лист итоговых проверок.")
             return None
 
-        df_all = pd.concat(frames, ignore_index=True)
+        df_all = pd.concat(dfs, ignore_index=True)
+        df_all = df_all.reset_index(drop=True)
         return df_all
     except Exception as e:
         log.error("Ошибка обработки файла итоговых проверок: %s", e)
         return None
 
 
-def _parse_final_date(val) -> Optional[date]:
-    """
-    Преобразует значение из столбцов O/P в дату.
-    Поддерживает текстовые и «экселевские» даты.
-    """
-    if val is None:
-        return None
-    try:
-        if isinstance(val, (datetime, pd.Timestamp)):
-            return val.date()
+   return val.date()
         if isinstance(val, (int, float)) and not pd.isna(val):
             dt = pd.to_datetime(val, errors="coerce")
             if isinstance(dt, (datetime, pd.Timestamp)):
@@ -1408,6 +1396,7 @@ def _parse_final_date(val) -> Optional[date]:
     return None
 
 
+
 def filter_final_checks_df(
     df: pd.DataFrame,
     start_date: Optional[date] = None,
@@ -1415,6 +1404,13 @@ def filter_final_checks_df(
     case_no: Optional[str] = None,
     basis: str = "any",  # "start" -> только O, "end" -> только P, "any" -> O или P
 ) -> pd.DataFrame:
+    """
+    Фильтрация итоговых проверок:
+    - по номеру дела (столбец B),
+    - по периоду дат (столбцы O / P) с выбором базы.
+    Работает устойчиво при любых типах данных (datetime, числа Excel, строки).
+    """
+    # Индексы столбцов
     idx_case = excel_col_to_index("B")
     idx_start = excel_col_to_index("O")
     idx_end = excel_col_to_index("P")
@@ -1423,53 +1419,66 @@ def filter_final_checks_df(
     if basis not in ("start", "end", "any"):
         basis = "any"
 
-    case_filter_norm = normalize_case_number(case_no) if case_no else None
+    df2 = df.copy()
+    mask = pd.Series(True, index=df2.index)
 
-    mask: List[bool] = []
-    for _, row in df.iterrows():
-        include = True
-
-        # --- фильтр по номеру дела ---
+    # --- Фильтр по номеру дела ---
+    if case_no and idx_case is not None and 0 <= idx_case < df2.shape[1]:
+        case_filter_norm = normalize_case_number(case_no)
         if case_filter_norm:
-            try:
-                case_val = row.iloc[idx_case]
-            except Exception:
-                case_val = None
-            val_norm = normalize_case_number(case_val)
-            if not val_norm or val_norm != case_filter_norm:
-                include = False
+            col_case = df2.iloc[:, idx_case]
+            case_mask = col_case.apply(
+                lambda v: normalize_case_number(v) == case_filter_norm
+            )
+            mask &= case_mask
 
-        # --- фильтр по периоду ---
-        if include and start_date and end_date:
-            try:
-                s_raw = row.iloc[idx_start]
-            except Exception:
-                s_raw = None
-            try:
-                e_raw = row.iloc[idx_end]
-            except Exception:
-                e_raw = None
+    # --- Фильтр по датам ---
+    if start_date and end_date:
+        start_ts = pd.Timestamp(start_date)
+        end_ts = pd.Timestamp(end_date)
 
-            d_start = _parse_final_date(s_raw)
-            d_end = _parse_final_date(e_raw)
+        def _make_date_series(col_idx: Optional[int]) -> pd.Series:
+            """Преобразует столбец в Series с Timestamp или NaT."""
+            if col_idx is None or col_idx < 0 or col_idx >= df2.shape[1]:
+                return pd.Series(pd.NaT, index=df2.index)
 
-            if basis == "start":
-                base = d_start
-            elif basis == "end":
-                base = d_end
-            else:  # "any"
-                base = d_start or d_end
+            s = df2.iloc[:, col_idx]
 
-            if base is None or base < start_date or base > end_date:
-                include = False
+            # Уже datetime-тип
+            if pd.api.types.is_datetime64_any_dtype(s):
+                return s
 
-        mask.append(include)
+            # Числовые значения (возможные экселевские даты)
+            if pd.api.types.is_numeric_dtype(s):
+                # пробуем как "excel serial" (дни с 1899-12-30)
+                return pd.to_datetime(s, origin="1899-12-30", unit="D", errors="coerce")
 
-    if not mask:
-        return df.iloc[0:0].copy()
+            # Всё остальное — как строки
+            s_str = s.astype(str).str.strip()
+            # Убираем лишние символы типа " г."
+            s_clean = s_str.str.replace(r"[^0-9\.]", "", regex=True)
+            dt = pd.to_datetime(s_clean, format="%d.%m.%Y", errors="coerce")
+            # если вообще ничего не распозналось в формате, пробуем общий парсер
+            if dt.isna().all():
+                dt = pd.to_datetime(s_str, dayfirst=True, errors="coerce")
+            return dt
 
-    df_f = df[mask].copy().reset_index(drop=True)
+        s_start = _make_date_series(idx_start)
+        s_end = _make_date_series(idx_end)
+
+        if basis == "start":
+            base = s_start
+        elif basis == "end":
+            base = s_end
+        else:  # "any": сначала O, если пусто — P
+            base = s_start.where(s_start.notna(), s_end)
+
+        between_mask = base.notna() & (base >= start_ts) & (base <= end_ts)
+        mask &= between_mask
+
+    df_f = df2[mask].copy().reset_index(drop=True)
     return df_f
+
 
 
 def build_final_checks_text_filtered(
