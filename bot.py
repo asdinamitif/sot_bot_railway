@@ -59,20 +59,16 @@ def _extract_spreadsheet_id_from_url(url: str) -> str:
     return ""
 
 
-# URL основной Google-таблицы
 SCHEDULE_URL_ENV = (os.getenv("SCHEDULE_URL") or "").strip()
 
-# ID таблицы
 _default_sheet_id = _extract_spreadsheet_id_from_url(SCHEDULE_URL_ENV)
 if not _default_sheet_id:
     _default_sheet_id = (os.getenv("GSHEETS_SPREADSHEET_ID") or "").strip()
 if not _default_sheet_id:
-    # запасной ID, чтобы код не упал
     _default_sheet_id = "1W_9Cs-LaX6KR4cE9xN71CliE6Lm_TyQqk8t3kQa4FCc"
 
 GSHEETS_SPREADSHEET_ID = _default_sheet_id
 
-# Ссылка на таблицу
 if SCHEDULE_URL_ENV:
     GOOGLE_SHEET_URL_DEFAULT = SCHEDULE_URL_ENV
 else:
@@ -81,7 +77,7 @@ else:
     )
 
 GSHEETS_SERVICE_ACCOUNT_JSON = (os.getenv("GSHEETS_SERVICE_ACCOUNT_JSON") or "").strip()
-SHEETS_SERVICE = None  # кеш клиента Google Sheets
+SHEETS_SERVICE = None
 
 DEFAULT_APPROVERS = [
     "@asdinamitif",
@@ -97,7 +93,7 @@ RESPONSIBLE_USERNAMES: Dict[str, List[str]] = {
     "смирнов": ["scri4"],
 }
 
-INSPECTOR_SHEET_NAME = "ПБ, АР,ММГН, АГО (2025)"  # лист для инспектора в общей книге
+INSPECTOR_SHEET_NAME = "ПБ, АР,ММГН, АГО (2025)"
 HARD_CODED_ADMINS = {398960707}
 
 SCHEDULE_NOTIFY_CHAT_ID_ENV = (os.getenv("SCHEDULE_NOTIFY_CHAT_ID") or "").strip()
@@ -105,15 +101,13 @@ SCHEDULE_NOTIFY_CHAT_ID = (
     int(SCHEDULE_NOTIFY_CHAT_ID_ENV) if SCHEDULE_NOTIFY_CHAT_ID_ENV else None
 )
 
-
-
+# ВТОРАЯ ТАБЛИЦА — итоговые проверки
 FINAL_CHECKS_SPREADSHEET_ID = (
     os.getenv(
         "FINAL_CHECKS_SPREADSHEET_ID",
         "1dUO3neTKzKI3D8P6fs_LJLmWlL7jw-FhohtJkjz4KuE",
     ).strip()
 )
-FINAL_CHECKS_LOCAL_PATH = os.getenv("FINAL_CHECKS_LOCAL_PATH", "final_checks.xlsx")
 
 
 def is_admin(uid: int) -> bool:
@@ -224,8 +218,77 @@ def get_col_by_letter(df: pd.DataFrame, letters: str) -> Optional[str]:
     return None
 
 
+def get_col_index_by_header(
+    df: pd.DataFrame, search_substr: str, fallback_letter: str
+) -> Optional[int]:
+    search_substr = search_substr.lower()
+    for i, col in enumerate(df.columns):
+        if search_substr in str(col).lower():
+            return i
+    idx = excel_col_to_index(fallback_letter)
+    if 0 <= idx < len(df.columns):
+        return idx
+    return None
+
+
+def normalize_onzs_value(val) -> Optional[str]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        n = int(float(s.replace(",", ".")))
+        return str(n)
+    except Exception:
+        pass
+    return s
+
+
+def normalize_case_number(val) -> str:
+    """
+    Нормализация номера дела:
+
+    - приводим все нестандартные тире к обычному '-';
+    - убираем пробелы;
+    - выбрасываем любые символы, кроме цифр и '-'.
+
+    Примеры:
+    'Дело № 03–46–108600 (ПП)' -> '03-46-108600'
+    ' 01-29-099900 ' -> '01-29-099900'
+    """
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if not s:
+        return ""
+
+    # все «косые» тире в нормальное
+    hyphens = ["\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212"]
+    for h in hyphens:
+        s = s.replace(h, "-")
+
+    # убираем пробелы
+    s = s.replace(" ", "")
+
+    # оставляем только цифры и '-'
+    cleaned_chars = []
+    for ch in s:
+        if ch.isdigit() or ch == "-":
+            cleaned_chars.append(ch)
+
+    return "".join(cleaned_chars)
+
+
+def get_case_col_index(df: pd.DataFrame) -> Optional[int]:
+    idx_i = excel_col_to_index("I")
+    if 0 <= idx_i < len(df.columns):
+        return idx_i
+    return get_col_index_by_header(df, "номер дела", "I")
+
+
 # -------------------------------------------------
-# БАЗА ДАННЫХ (график + согласование + инспектор)
+# БАЗА ДАННЫХ
 # -------------------------------------------------
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -271,7 +334,6 @@ def init_db() -> None:
            )"""
     )
 
-    # Таблица выездов инспектора
     c.execute(
         """CREATE TABLE IF NOT EXISTS inspector_visits (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -399,9 +461,6 @@ def update_schedule_approval_status(
 # Инспектор: БД
 # -------------------------------------------------
 def save_inspector_to_db(form: Dict[str, Any]) -> bool:
-    """
-    Сохраняет выезд в локную таблицу inspector_visits.
-    """
     try:
         conn = get_db()
         c = conn.cursor()
@@ -447,6 +506,14 @@ def fetch_inspector_visits(limit: int = 50) -> List[sqlite3.Row]:
     return rows
 
 
+def clear_inspector_visits() -> None:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("DELETE FROM inspector_visits")
+    conn.commit()
+    conn.close()
+
+
 # -------------------------------------------------
 # Клавиатуры
 # -------------------------------------------------
@@ -454,14 +521,16 @@ def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["📅 График", "📝 Замечания"],
-            ["📊 Итоговая", "🏗 ОНзС"],
             ["Инспектор", "📈 Аналитика"],
+            ["Итоговые проверки"],
         ],
         resize_keyboard=True,
     )
 
 
-def build_schedule_inline(is_admin_flag: bool, settings: dict):
+def build_schedule_inline(
+    is_admin_flag: bool, settings: dict, user_tag: Optional[str] = None
+) -> InlineKeyboardMarkup:
     buttons = [
         [
             InlineKeyboardButton("🔄 Обновить", callback_data="schedule_refresh"),
@@ -473,13 +542,34 @@ def build_schedule_inline(is_admin_flag: bool, settings: dict):
         buttons.append(
             [InlineKeyboardButton("👥 Согласующие", callback_data="schedule_approvers")]
         )
+
+    approvers = get_current_approvers(settings)
+    if user_tag and user_tag in approvers:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"✅ Согласовать ({user_tag})",
+                    callback_data=f"schedule_approve:{user_tag}",
+                ),
+                InlineKeyboardButton(
+                    f"✏️ На доработку ({user_tag})",
+                    callback_data=f"schedule_rework:{user_tag}",
+                ),
+            ]
+        )
+
     return InlineKeyboardMarkup(buttons)
 
 
 def remarks_menu_inline() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("❌ Не устранены", callback_data="remarks_not_done")],
+            [
+                InlineKeyboardButton(
+                    "🔎 Поиск по номеру дела", callback_data="remarks_search_case"
+                )
+            ],
+            [InlineKeyboardButton("🏗 ОНзС", callback_data="remarks_onzs")],
             [InlineKeyboardButton("📥 Открыть файл", callback_data="remarks_download")],
         ]
     )
@@ -491,14 +581,42 @@ def inspector_menu_inline() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("➕ Добавить выезд", callback_data="inspector_add")],
             [
                 InlineKeyboardButton("📋 Список выездов", callback_data="inspector_list"),
-                InlineKeyboardButton("📥 Скачать Excel", callback_data="inspector_download"),
+                InlineKeyboardButton(
+                    "📥 Скачать Excel", callback_data="inspector_download"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔄 Обновить", callback_data="inspector_reset"
+                )
+            ],
+        ]
+    )
+
+
+def final_checks_menu_inline() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📅 За неделю", callback_data="final_week"),
+                InlineKeyboardButton("📆 За месяц", callback_data="final_month"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📊 Выбрать период", callback_data="final_period"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔎 По номеру дела", callback_data="final_search_case"
+                )
             ],
         ]
     )
 
 
 # -------------------------------------------------
-# График: чтение листа «График»
+# График
 # -------------------------------------------------
 def get_schedule_df() -> Optional[pd.DataFrame]:
     SHEET = "График"
@@ -524,161 +642,6 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
         return None
 
 
-
-# -------------------------------------------------
-# Итоговые проверки: загрузка локального файла и фильтрация
-# -------------------------------------------------
-def refresh_final_checks_local_file() -> bool:
-    """
-    Скачивает актуальную таблицу итоговых проверок в локальный файл FINAL_CHECKS_LOCAL_PATH.
-    Старую версию файла при наличии удаляет.
-    """
-    sheet_id = FINAL_CHECKS_SPREADSHEET_ID
-    if not sheet_id:
-        log.error("FINAL_CHECKS_SPREADSHEET_ID не задан.")
-        return False
-
-    url = build_export_url(sheet_id)
-
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-    except Exception as e:
-        log.error("Ошибка скачивания Excel (итоговые проверки): %s", e)
-        return False
-
-    try:
-        # удаляем старый файл, если есть
-        try:
-            os.remove(FINAL_CHECKS_LOCAL_PATH)
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            log.warning("Не удалось удалить старый файл итоговых проверок: %s", e)
-
-        with open(FINAL_CHECKS_LOCAL_PATH, "wb") as f:
-            f.write(resp.content)
-        log.info("Файл итоговых проверок обновлён: %s", FINAL_CHECKS_LOCAL_PATH)
-        return True
-    except Exception as e:
-        log.error("Ошибка сохранения файла итоговых проверок: %s", e)
-        return False
-
-
-def get_final_checks_df() -> Optional[pd.DataFrame]:
-    """
-    Читает локальный файл итоговых проверок FINAL_CHECKS_LOCAL_PATH,
-    который обновляется при входе в раздел «Итоговые проверки».
-    Собирает данные со всех листов книги и склеивает в один DataFrame.
-    """
-    if not os.path.exists(FINAL_CHECKS_LOCAL_PATH):
-        log.warning(
-            "Локальный файл итоговых проверок не найден, пробуем скачать заново."
-        )
-        if not refresh_final_checks_local_file():
-            return None
-
-    try:
-        xls = pd.ExcelFile(FINAL_CHECKS_LOCAL_PATH)
-        if not xls.sheet_names:
-            log.error("Файл итоговых проверок пуст (нет листов).")
-            return None
-
-        dfs: List[pd.DataFrame] = []
-        for sheet_name in xls.sheet_names:
-            try:
-                df_sheet = pd.read_excel(xls, sheet_name=sheet_name)
-                df_sheet = df_sheet.dropna(how="all")
-                if df_sheet.empty:
-                    continue
-                dfs.append(df_sheet)
-            except Exception as e:
-                log.error(
-                    "Ошибка чтения листа итоговых проверок '%s': %s",
-                    sheet_name,
-                    e,
-                )
-
-        if not dfs:
-            log.error("Не удалось прочитать ни один лист итоговых проверок.")
-            return None
-
-        df_all = pd.concat(dfs, ignore_index=True)
-        df_all = df_all.reset_index(drop=True)
-        return df_all
-    except Exception as e:
-        log.error("Ошибка чтения локального файла итоговых проверок: %s", e)
-        return None
-
-
-def filter_final_checks_by_period(df: pd.DataFrame, days: int) -> pd.DataFrame:
-    """
-    Фильтрует итоговые проверки по дате окончания (столбец P) за последние `days` дней.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    idx_p = excel_col_to_index("P")
-    if idx_p < 0 or idx_p >= len(df.columns):
-        log.error("Не удалось найти столбец P (дата окончания) в итоговых проверках.")
-        return pd.DataFrame()
-
-    col_p = df.columns[idx_p]
-    s = df[col_p]
-
-    # Приводим к datetime
-    if not pd.api.types.is_datetime64_any_dtype(s):
-        # сначала пробуем как числа (экселевские даты)
-        if pd.api.types.is_numeric_dtype(s):
-            s_parsed = pd.to_datetime(
-                s, origin="1899-12-30", unit="D", errors="coerce"
-            )
-        else:
-            s_parsed = pd.to_datetime(s.astype(str).str.strip(), dayfirst=True, errors="coerce")
-    else:
-        s_parsed = s
-
-    start_date = local_now().date() - timedelta(days=days)
-    end_date = local_now().date()
-    start_ts = pd.Timestamp(start_date)
-    end_ts = pd.Timestamp(end_date)
-
-    mask = s_parsed.notna() & (s_parsed >= start_ts) & (s_parsed <= end_ts)
-    return df[mask].copy().reset_index(drop=True)
-
-
-async def send_final_checks_subset(
-    chat_id: int,
-    dataframe: pd.DataFrame,
-    caption: str,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    """
-    Отправляет отфильтрованный кусок итоговых проверок отдельным Excel-файлом.
-    """
-    if dataframe is None or dataframe.empty:
-        await context.bot.send_message(
-            chat_id=chat_id, text="За выбранный период итоговые проверки не найдены."
-        )
-        return
-
-    bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        dataframe.to_excel(writer, sheet_name="Итоговые проверки", index=False)
-
-    bio.seek(0)
-    filename = f"Итоговые_проверки_{date.today().strftime('%d.%m.%Y')}.xlsx"
-
-    await context.bot.send_document(
-        chat_id=chat_id,
-        document=InputFile(bio, filename=filename),
-        caption=caption,
-    )
-
-
-# -------------------------------------------------
-# КРАСИВЫЙ EXCEL ДЛЯ ГРАФИКА
-# -------------------------------------------------
 HEADER_FILL = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
 BORDER = Border(
@@ -692,12 +655,21 @@ BORDER = Border(
 async def send_schedule_xlsx(
     chat_id: int, dataframe: pd.DataFrame, context: ContextTypes.DEFAULT_TYPE
 ):
-    """
-    Отправляет красиво отформатированный Excel-файл графика
-    с блоком согласования внизу листа.
-    """
     df = dataframe.copy().reset_index(drop=True)
-    df.index += 1
+    headers = list(df.columns)
+
+    date_col_name: Optional[str] = None
+    for h in headers:
+        if "дата выезда" in str(h).lower():
+            date_col_name = h
+            break
+    if date_col_name:
+        try:
+            df[date_col_name] = pd.to_datetime(
+                df[date_col_name], errors="coerce", dayfirst=True
+            )
+        except Exception:
+            pass
 
     settings = get_schedule_state()
     version = get_schedule_version(settings)
@@ -708,36 +680,34 @@ async def send_schedule_xlsx(
         df.to_excel(
             writer,
             sheet_name="График выездов",
-            index=True,
-            startrow=2,  # данные с 3-й строки (A3)
+            index=False,
+            startrow=2,
             header=False,
         )
 
         wb = writer.book
         ws = writer.sheets["График выездов"]
 
-        headers = ["№ п/п"] + list(dataframe.columns)
         for col_num, value in enumerate(headers, 1):
             cell = ws.cell(row=2, column=col_num, value=value)
             cell.fill = HEADER_FILL
             cell.font = HEADER_FONT
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        # автоширина
         for column in ws.columns:
             max_length = 0
-            column_letter = column[0].column_letter
+            col_letter = column[0].column_letter
             for cell in column:
                 try:
-                    if len(str(cell.value)) > max_length:
+                    if cell.value is not None and len(str(cell.value)) > max_length:
                         max_length = len(str(cell.value))
                 except Exception:
                     pass
-            ws.column_dimensions[column_letter].width = min(max_length + 4, 50)
+            ws.column_dimensions[col_letter].width = min(max_length + 4, 50)
 
-        ws.freeze_panes = ws["B3"]
+        ws.freeze_panes = ws["A3"]
 
-        last_col_letter = chr(64 + len(headers))
+        last_col_letter = ws.cell(row=2, column=len(headers)).column_letter
         ws.auto_filter.ref = f"A2:{last_col_letter}{len(df) + 2}"
 
         for row in ws[f"A3:{last_col_letter}{len(df) + 2}"]:
@@ -767,15 +737,50 @@ async def send_schedule_xlsx(
         )
         ws.add_table(tab)
 
-        # красивый блок согласования
+        date_idx = None
+        onzs_idx = None
+        dev_idx = None
+        obj_idx = None
+
+        for i, h in enumerate(headers, start=1):
+            h_low = str(h).lower()
+            if date_idx is None and "дата выезда" in h_low:
+                date_idx = i
+            if onzs_idx is None and "онзс" in h_low:
+                onzs_idx = i
+            if dev_idx is None and "наименование застройщика" in h_low:
+                dev_idx = i
+            if obj_idx is None and "наименование объекта" in h_low:
+                obj_idx = i
+
+        for row_idx in range(3, len(df) + 3):
+            if date_idx:
+                cell = ws.cell(row=row_idx, column=date_idx)
+                cell.number_format = "DD.MM.YYYY"
+            if onzs_idx:
+                cell = ws.cell(row=row_idx, column=onzs_idx)
+                cell.alignment = Alignment(
+                    horizontal="center", vertical="center", wrap_text=False
+                )
+            if dev_idx:
+                cell = ws.cell(row=row_idx, column=dev_idx)
+                cell.alignment = Alignment(
+                    horizontal="left", vertical="center", wrap_text=True
+                )
+            if obj_idx:
+                cell = ws.cell(row=row_idx, column=obj_idx)
+                cell.alignment = Alignment(
+                    horizontal="left", vertical="center", wrap_text=True
+                )
+
         if approvals:
             last_data_row = len(df) + 2
             summary_start = last_data_row + 2
 
-            header_text = build_schedule_header(version, approvals)
+            header = build_schedule_header(version, approvals)
             ws.merge_cells(f"A{summary_start}:{last_col_letter}{summary_start}")
             cell_header = ws[f"A{summary_start}"]
-            cell_header.value = header_text
+            cell_header.value = header
             cell_header.font = Font(bold=True, size=12, color="FFFFFF")
             cell_header.fill = PatternFill(
                 start_color="4F81BD", end_color="4F81BD", fill_type="solid"
@@ -814,7 +819,9 @@ async def send_schedule_xlsx(
                 cell_pending = ws[f"A{row_ptr}"]
                 cell_pending.value = "⚠ Есть несогласованные/на доработке."
                 cell_pending.font = Font(italic=True, color="C00000")
-                cell_pending.alignment = Alignment(horizontal="left", vertical="center")
+                cell_pending.alignment = Alignment(
+                    horizontal="left", vertical="center"
+                )
                 for col_idx in range(1, len(headers) + 1):
                     ws.cell(row=row_ptr, column=col_idx).border = BORDER
 
@@ -882,8 +889,9 @@ def write_schedule_summary_to_sheet(version: int, approvals: List[sqlite3.Row]) 
             ["Согласовано всеми:"],
         ]
         for r in approvals:
-            line = f"{r['approver']} — {_format_dt(r['decided_at'])} ✅"
-            rows.append([line])
+            rows.append(
+                [f"{r['approver']} — {_format_dt(r['decided_at'])} ✅"]
+            )
 
         body = {"values": rows}
 
@@ -942,8 +950,9 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
     elif pending:
         lines.append("На согласовании у:")
         for a in pending:
-            req = _format_dt(by_approver[a]["requested_at"])
-            lines.append(f"• {a} — запрошено {req}")
+            lines.append(
+                f"• {a} — запрошено {_format_dt(by_approver[a]['requested_at'])}"
+            )
         if approved:
             lines.append("")
             lines.append("Уже согласовали:")
@@ -998,10 +1007,10 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
             continue
 
         flags = {
-            "pb": is_net(row.iloc[idx_pb]),
-            "pb_zk": is_net(row.iloc[idx_pb_zk]),
-            "ar": is_net(row.iloc[idx_ar]),
-            "eom": is_net(row.iloc[idx_eom]),
+            "pb": is_net(row.iloc[idx_pb]) if idx_pb < len(row) else False,
+            "pb_zk": is_net(row.iloc[idx_pb_zk]) if idx_pb_zk < len(row) else False,
+            "ar": is_net(row.iloc[idx_ar]) if idx_ar < len(row) else False,
+            "eom": is_net(row.iloc[idx_eom]) if idx_eom < len(row) else False,
         }
 
         if not any(flags.values()):
@@ -1051,8 +1060,237 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+def build_remarks_not_done_by_onzs(df: pd.DataFrame, onzs_value: str) -> str:
+    sheet_name = get_current_remarks_sheet_name()
+
+    onzs_idx = get_col_index_by_header(df, "онзс", "D")
+    if onzs_idx is None:
+        return "Не удалось определить столбец ОНзС в файле замечаний."
+
+    COLS = {
+        "case": "I",
+        "pb": "Q",
+        "pb_zk": "R",
+        "ar": "X",
+        "eom": "AD",
+    }
+
+    TITLES = {
+        "pb": "Отметка об устранении замечаний ПБ да/нет",
+        "pb_zk": "Отметка об устранении замечаний ПБ в ЗК КНД да/нет",
+        "ar": "Отметка об устранении нарушений АР, ММГН, АГО да/нет",
+        "eom": "Отметка об устранении нарушений ЭОМ да/нет",
+    }
+
+    idx_case = excel_col_to_index(COLS["case"])
+    idx_pb = excel_col_to_index(COLS["pb"])
+    idx_pb_zk = excel_col_to_index(COLS["pb_zk"])
+    idx_ar = excel_col_to_index(COLS["ar"])
+    idx_eom = excel_col_to_index(COLS["eom"])
+
+    def is_net(val):
+        if val is None:
+            return False
+        text = str(val).lower().replace("\n", " ").strip()
+        if not text or text in {"-", "н/д"}:
+            return False
+        return text.startswith("нет")
+
+    grouped = {}
+
+    num_str = normalize_onzs_value(onzs_value)
+
+    for _, row in df.iterrows():
+        try:
+            val_raw = row.iloc[onzs_idx]
+        except Exception:
+            val_raw = None
+
+        val_norm = normalize_onzs_value(val_raw)
+        if val_norm != num_str:
+            continue
+
+        case = ""
+        try:
+            case = str(row.iloc[idx_case]).strip()
+        except Exception:
+            pass
+
+        if not case:
+            continue
+
+        flags = {
+            "pb": is_net(row.iloc[idx_pb]) if idx_pb < len(row) else False,
+            "pb_zk": is_net(row.iloc[idx_pb_zk]) if idx_pb_zk < len(row) else False,
+            "ar": is_net(row.iloc[idx_ar]) if idx_ar < len(row) else False,
+            "eom": is_net(row.iloc[idx_eom]) if idx_eom < len(row) else False,
+        }
+
+        if not any(flags.values()):
+            continue
+
+        if case not in grouped:
+            grouped[case] = {"pb": set(), "ar": set(), "eom": set()}
+
+        if flags["pb"]:
+            grouped[case]["pb"].add(TITLES["pb"])
+        if flags["pb_zk"]:
+            grouped[case]["pb"].add(TITLES["pb_zk"])
+        if flags["ar"]:
+            grouped[case]["ar"].add(TITLES["ar"])
+        if flags["eom"]:
+            grouped[case]["eom"].add(TITLES["eom"])
+
+    if not grouped:
+        return (
+            f"По ОНзС {onzs_value} нет строк со статусом «нет».\n"
+            f"Лист: {sheet_name}"
+        )
+
+    lines = [
+        f"Строки со статусом «НЕ УСТРАНЕНЫ (нет)» по ОНзС {onzs_value}",
+        "",
+        "Лист: " + sheet_name,
+        "",
+    ]
+
+    for case, blocks in grouped.items():
+        parts = []
+        if blocks["pb"]:
+            parts.append(
+                "Пожарная безопасность: "
+                + ", ".join(b + " - нет" for b in blocks["pb"])
+            )
+        if blocks["ar"]:
+            parts.append(
+                "Архитектура, ММГН, АГО: "
+                + ", ".join(b + " - нет" for b in blocks["ar"])
+            )
+        if blocks["eom"]:
+            parts.append(
+                "Электроснабжение: "
+                + ", ".join(b + " - нет" for b in blocks["eom"])
+            )
+        lines.append(f"• {case} — " + "; ".join(parts))
+
+    return "\n".join(lines)
+
+
+def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
+    sheet_name = get_current_remarks_sheet_name()
+
+    case_no = case_no.strip()
+    if not case_no:
+        return "Номер дела не указан."
+
+    target = normalize_case_number(case_no)
+
+    idx_case = get_case_col_index(df)
+    if idx_case is None:
+        return (
+            "Не удалось определить столбец «Номер дела (I)» в файле замечаний. "
+            "Проверьте структуру листа."
+        )
+
+    idx_date = get_col_index_by_header(df, "дата выезда", "B")
+    idx_onzs = get_col_index_by_header(df, "онзс", "D")
+    idx_dev = get_col_index_by_header(df, "наименование застройщика", "F")
+    idx_obj = get_col_index_by_header(df, "наименование объекта", "G")
+    idx_addr = get_col_index_by_header(df, "строительный адрес", "H")
+
+    idx_pb = excel_col_to_index("Q")
+    idx_pb_zk = excel_col_to_index("R")
+    idx_ar = excel_col_to_index("X")
+    idx_eom = excel_col_to_index("AD")
+
+    mask: List[bool] = []
+    for _, row in df.iterrows():
+        try:
+            val_raw = row.iloc[idx_case]
+        except Exception:
+            val_raw = None
+        val_norm = normalize_case_number(val_raw)
+        mask.append(val_norm == target)
+
+    if not any(mask):
+        return (
+            f"По номеру дела {case_no} ничего не найдено.\n"
+            f"Лист: {sheet_name}"
+        )
+
+    df_sel = df[mask]
+
+    lines: List[str] = [
+        f"Результаты поиска по номеру дела: {case_no}",
+        "",
+        f"Лист: {sheet_name}",
+        "",
+    ]
+
+    for _, row in df_sel.iterrows():
+
+        def safe(idx: Optional[int]) -> str:
+            if idx is None:
+                return ""
+            try:
+                return str(row.iloc[idx]).strip()
+            except Exception:
+                return ""
+
+        date_raw = safe(idx_date)
+        date_fmt = date_raw
+        try:
+            if date_raw:
+                dt = pd.to_datetime(date_raw, dayfirst=True, errors="ignore")
+                if isinstance(dt, (datetime, pd.Timestamp)):
+                    date_fmt = dt.strftime("%d.%m.%Y")
+        except Exception:
+            pass
+
+        onzs_val = safe(idx_onzs)
+        dev_val = safe(idx_dev)
+        obj_val = safe(idx_obj)
+        addr_val = safe(idx_addr)
+
+        def safe_status(idx: int) -> str:
+            try:
+                if idx < len(row):
+                    return str(row.iloc[idx]).strip()
+            except Exception:
+                pass
+            return ""
+
+        pb_val = safe_status(idx_pb)
+        pb_zk_val = safe_status(idx_pb_zk)
+        ar_val = safe_status(idx_ar)
+        eom_val = safe_status(idx_eom)
+
+        lines.append(f"Номер дела: {case_no}")
+        if date_fmt:
+            lines.append(f"Дата выезда: {date_fmt}")
+        if onzs_val:
+            lines.append(f"ОНзС: {onzs_val}")
+        if dev_val:
+            lines.append(f"Застройщик: {dev_val}")
+        if obj_val:
+            lines.append(f"Объект: {obj_val}")
+        if addr_val:
+            lines.append(f"Адрес: {addr_val}")
+
+        lines.append("")
+        lines.append(f"ПБ: {pb_val or '-'}")
+        lines.append(f"ПБ ЗК: {pb_zk_val or '-'}")
+        lines.append(f"АР/ММГН/АГО: {ar_val or '-'}")
+        lines.append(f"ЭОМ: {eom_val or '-'}")
+        lines.append("")
+        lines.append("────────────")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 # -------------------------------------------------
-# Длинный текст по частям
+# Отправка длинного текста
 # -------------------------------------------------
 async def send_long_text(chat, text: str, chunk_size=3500):
     lines = text.split("\n")
@@ -1070,7 +1308,7 @@ async def send_long_text(chat, text: str, chunk_size=3500):
 
 
 # -------------------------------------------------
-# Считывание листа замечаний
+# Лист замечаний
 # -------------------------------------------------
 def get_remarks_df_current() -> Optional[pd.DataFrame]:
     sheet = get_current_remarks_sheet_name()
@@ -1090,20 +1328,281 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
 
 
 # -------------------------------------------------
-# Инспектор → Google Sheets (ячейка D с двумя строками)
+# Итоговые проверки: чтение, фильтр, текст, Excel
+# -------------------------------------------------
+def get_final_checks_df() -> Optional[pd.DataFrame]:
+    """
+    Читает файл итоговых проверок из отдельной таблицы FINAL_CHECKS_SPREADSHEET_ID.
+    Берём первый лист книги.
+    """
+    sheet_id = FINAL_CHECKS_SPREADSHEET_ID
+    if not sheet_id:
+        log.error("FINAL_CHECKS_SPREADSHEET_ID не задан.")
+        return None
+
+    url = build_export_url(sheet_id)
+
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        log.error("Ошибка скачивания Excel (итоговые проверки): %s", e)
+        return None
+
+    try:
+        xls = pd.ExcelFile(BytesIO(resp.content))
+        if not xls.sheet_names:
+            log.error("Файл итоговых проверок пуст (нет листов).")
+            return None
+        sheet_name = xls.sheet_names[0]
+        df = pd.read_excel(xls, sheet_name=sheet_name)
+        df = df.dropna(how="all").reset_index(drop=True)
+        return df
+    except Exception as e:
+        log.error("Ошибка чтения листа итоговых проверок: %s", e)
+        return None
+
+
+def _parse_final_date(val) -> Optional[date]:
+    """
+    Преобразует значение из столбцов O/P в дату.
+    Поддерживает текстовые и «экселевские» даты.
+    """
+    if val is None:
+        return None
+    try:
+        if isinstance(val, (datetime, pd.Timestamp)):
+            return val.date()
+        if isinstance(val, (int, float)) and not pd.isna(val):
+            dt = pd.to_datetime(val, errors="coerce")
+            if isinstance(dt, (datetime, pd.Timestamp)):
+                return dt.date()
+        dt = pd.to_datetime(str(val), dayfirst=True, errors="coerce")
+        if isinstance(dt, (datetime, pd.Timestamp)):
+            return dt.date()
+    except Exception:
+        return None
+    return None
+
+
+def filter_final_checks_df(
+    df: pd.DataFrame,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    case_no: Optional[str] = None,
+    basis: str = "any",  # "start" -> только O, "end" -> только P, "any" -> O или P
+) -> pd.DataFrame:
+    idx_case = excel_col_to_index("B")
+    idx_start = excel_col_to_index("O")
+    idx_end = excel_col_to_index("P")
+
+    basis = (basis or "any").lower()
+    if basis not in ("start", "end", "any"):
+        basis = "any"
+
+    case_filter_norm = normalize_case_number(case_no) if case_no else None
+
+    mask: List[bool] = []
+    for _, row in df.iterrows():
+        include = True
+
+        # --- фильтр по номеру дела ---
+        if case_filter_norm:
+            try:
+                case_val = row.iloc[idx_case]
+            except Exception:
+                case_val = None
+            val_norm = normalize_case_number(case_val)
+            if not val_norm or val_norm != case_filter_norm:
+                include = False
+
+        # --- фильтр по периоду ---
+        if include and start_date and end_date:
+            try:
+                s_raw = row.iloc[idx_start]
+            except Exception:
+                s_raw = None
+            try:
+                e_raw = row.iloc[idx_end]
+            except Exception:
+                e_raw = None
+
+            d_start = _parse_final_date(s_raw)
+            d_end = _parse_final_date(e_raw)
+
+            if basis == "start":
+                base = d_start
+            elif basis == "end":
+                base = d_end
+            else:  # "any"
+                base = d_start or d_end
+
+            if base is None or base < start_date or base > end_date:
+                include = False
+
+        mask.append(include)
+
+    if not mask:
+        return df.iloc[0:0].copy()
+
+    df_f = df[mask].copy().reset_index(drop=True)
+    return df_f
+
+
+def build_final_checks_text_filtered(
+    df: pd.DataFrame,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    case_no: Optional[str] = None,
+    header: str = "📋 Итоговые проверки",
+    basis: str = "any",  # "start" / "end" / "any"
+) -> str:
+    """
+    Универсальный вывод итоговых проверок:
+    - фильтр по периоду (start_date / end_date) по выбранной базе (O или P);
+    - фильтр по номеру дела (case_no).
+    """
+    df_f = filter_final_checks_df(
+        df,
+        start_date=start_date,
+        end_date=end_date,
+        case_no=case_no,
+        basis=basis,
+    )
+
+    idx_case = excel_col_to_index("B")
+    idx_obj = excel_col_to_index("D")
+    idx_addr = excel_col_to_index("E")
+    idx_start = excel_col_to_index("O")
+    idx_end = excel_col_to_index("P")
+
+    lines: List[str] = [header, ""]
+
+    if df_f.empty:
+        if case_no:
+            return (
+                f"По номеру дела {case_no} в таблице итоговых проверок ничего не найдено."
+            )
+        if start_date and end_date:
+            return (
+                f"За период {start_date:%d.%m.%Y} — {end_date:%d.%m.%Y} "
+                f"итоговые проверки не найдены."
+            )
+        return "В таблице итоговых проверок нет строк с заполненным номером дела (B)."
+
+    for _, row in df_f.iterrows():
+
+        def safe_text(idx: int) -> str:
+            try:
+                val = row.iloc[idx]
+            except Exception:
+                return ""
+            if pd.isna(val):
+                return ""
+            return str(val).strip()
+
+        case_val = safe_text(idx_case)
+        if not case_val:
+            continue
+
+        obj = safe_text(idx_obj)
+        addr = safe_text(idx_addr)
+
+        d_start_raw = row.iloc[idx_start] if idx_start < len(row) else None
+        d_end_raw = row.iloc[idx_end] if idx_end < len(row) else None
+
+        row_start = _parse_final_date(d_start_raw)
+        row_end = _parse_final_date(d_end_raw)
+
+        def fmt_date(d: Optional[date]) -> str:
+            return d.strftime("%d.%m.%Y") if d else ""
+
+        d_start = fmt_date(row_start)
+        d_end = fmt_date(row_end)
+
+        lines.append(f"Номер дела: {case_val}")
+        if obj:
+            lines.append(f"Объект: {obj}")
+        if addr:
+            lines.append(f"Адрес: {addr}")
+        if d_start or d_end:
+            if d_start and d_end:
+                lines.append(f"Период итоговой проверки: {d_start} — {d_end}")
+            elif d_start:
+                lines.append(f"Дата начала итоговой проверки: {d_start}")
+            else:
+                lines.append(f"Дата окончания итоговой проверки: {d_end}")
+        lines.append("")
+        lines.append("────────────")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def build_final_checks_text(df: pd.DataFrame) -> str:
+    """
+    Старый интерфейс (без фильтров) — на всякий случай.
+    """
+    return build_final_checks_text_filtered(df)
+
+
+async def send_final_checks_xlsx_filtered(
+    chat_id: int,
+    df: pd.DataFrame,
+    context: ContextTypes.DEFAULT_TYPE,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    case_no: Optional[str] = None,
+    filename_suffix: str = "",
+    basis: str = "any",
+):
+    df_f = filter_final_checks_df(
+        df,
+        start_date=start_date,
+        end_date=end_date,
+        case_no=case_no,
+        basis=basis,
+    )
+    if df_f.empty:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Нет данных для выгрузки по выбранным условиям.",
+        )
+        return
+
+    bio = BytesIO()
+    df_f.to_excel(bio, sheet_name="Итоговые проверки", index=False)
+    bio.seek(0)
+
+    fname = "Итоговые_проверки"
+    parts = []
+    if case_no:
+        parts.append(f"дело_{case_no}")
+    if start_date and end_date:
+        parts.append(f"{start_date:%d.%m.%Y}-{end_date:%d.%m.%Y}")
+    if filename_suffix:
+        parts.append(filename_suffix)
+    if parts:
+        fname += "_" + "_".join(parts)
+    fname += ".xlsx"
+
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(bio, filename=fname),
+        caption="Итоговые проверки (фильтрованный список)",
+    )
+
+
+# -------------------------------------------------
+# Инспектор → Google Sheets
 # -------------------------------------------------
 def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
-    """
-    Пробуем записать выезд в общий файл Google Sheets.
-    Если не получится — возвращаем False, но локно всё равно сохраняем.
-    """
     service = get_sheets_service()
     if service is None:
         log.error("Google Sheets API недоступен.")
         return False
 
     try:
-        # Оформляем как в вашей таблице: две строки в одной ячейке
         area_str = str(form.get("area", "")).replace(".", ",")
         floors_str = str(form.get("floors", ""))
 
@@ -1149,18 +1648,17 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
 
 
 # -------------------------------------------------
-# Инспектор — пошаговый мастер
+# Инспектор — мастер
 # -------------------------------------------------
 async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     form = context.user_data.get("inspector_form", {}) or {}
     step = form.get("step")
 
-    # если step потерялся – перезапускаем мастер
     if not step:
         context.user_data["inspector_form"] = {"step": "date"}
         await update.message.reply_text(
-            "👮‍♂️ Новый выезд инспектора\n\n"
+            "👮‍♂️ Выезд инспектора\n\n"
             "1/8. Дата выезда (ДД.ММ.ГГГГ):"
         )
         return
@@ -1277,33 +1775,67 @@ def onzs_menu_inline() -> InlineKeyboardMarkup:
 
 
 def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
-    col_case = get_col_by_letter(df, "I")
-    col_onzs = get_col_by_letter(df, "E")
-    col_addr = get_col_by_letter(df, "H")
+    onzs_idx = get_col_index_by_header(df, "онзс", "D")
+    if onzs_idx is None:
+        return "Не удалось определить столбец ОНзС в файле замечаний."
 
-    if not col_case or not col_onzs:
-        return "Не удалось определить структуру файла."
+    case_idx = get_case_col_index(df)
+    addr_idx = get_col_index_by_header(df, "строительный адрес", "H")
 
-    df_f = df[df[col_onzs].astype(str).str.strip() == str(number).strip()]
+    num_str = normalize_onzs_value(number)
+    mask: List[bool] = []
+    for _, row in df.iterrows():
+        try:
+            val_raw = row.iloc[onzs_idx]
+        except Exception:
+            val_raw = None
+        val_norm = normalize_onzs_value(val_raw)
+        mask.append(val_norm == num_str)
 
-    if df_f.empty:
+    if not any(mask):
         return f"Нет объектов с ОНзС = {number}."
 
-    lines = [f"ОНзС = {number}", ""]
+    df_f = df[mask]
+
+    lines = [f"ОНзС = {number}", f"Найдено дел: {len(df_f)}", ""]
 
     for _, row in df_f.iterrows():
-        case_no = str(row[col_case]).strip()
-        addr = str(row[col_addr]).strip() if col_addr else ""
-        if addr:
+
+        def safe(idx: Optional[int]) -> str:
+            if idx is None:
+                return ""
+            try:
+                val = row.iloc[idx]
+            except Exception:
+                return ""
+            try:
+                if pd.isna(val):
+                    return ""
+            except Exception:
+                pass
+            s = str(val).strip()
+            if not s or s.lower() == "nan":
+                return ""
+            return s
+
+        case_no = safe(case_idx)
+        addr = safe(addr_idx)
+
+        if not case_no and not addr:
+            continue
+
+        if case_no and addr:
             lines.append(f"• {case_no} — {addr}")
-        else:
+        elif case_no:
             lines.append(f"• {case_no}")
+        else:
+            lines.append(f"• {addr}")
 
     return "\n".join(lines)
 
 
 # -------------------------------------------------
-# Инспектор — просмотр и Excel
+# Инспектор — список/Excel
 # -------------------------------------------------
 def build_inspector_list_text(rows: List[sqlite3.Row]) -> str:
     if not rows:
@@ -1391,7 +1923,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = get_schedule_state()
     version = get_schedule_version(settings)
 
-    # ---------- ГРАФИК ----------
+    # --- ГРАФИК ---
     if data == "schedule_refresh":
         df = get_schedule_df()
         if df is None:
@@ -1432,7 +1964,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---------- Согласование ----------
     if data.startswith("schedule_approve:") or data.startswith("schedule_rework:"):
         action, approver_tag = data.split(":", 1)
         user_username = user.username or ""
@@ -1486,7 +2017,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # ---------- ЗАМЕЧАНИЯ ----------
+    # --- ЗАМЕЧАНИЯ ---
+    if data == "remarks_search_case":
+        context.user_data["awaiting_case_search"] = True
+        await query.message.reply_text(
+            "Введите номер дела (формат 00-00-000000), который нужно найти:"
+        )
+        return
+
+    if data == "remarks_onzs":
+        kb = onzs_menu_inline()
+        msg = (
+            "🏗 Раздел «ОНзС»\n\n"
+            "Выберите номер ОНзС, чтобы увидеть список дел (Номер дела (I) + адрес) "
+            "из текущего файла замечаний.\n"
+            "Для выбранного ОНзС можно отдельно показать только неустранённые замечания."
+        )
+        await query.message.reply_text(msg, reply_markup=kb)
+        return
+
     if data == "remarks_not_done":
         await query.message.reply_text("Ищу строки со статусом «нет»...")
         df = get_remarks_df_current()
@@ -1506,7 +2055,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---------- ОНЗС ----------
     if data.startswith("onzs_filter_"):
         number = data.replace("onzs_filter_", "")
         df = get_remarks_df_current()
@@ -1515,13 +2063,40 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         text = build_onzs_list_by_number(df, number)
         await send_long_text(query.message.chat, text)
+
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"❌ Не устранены (ОНзС {number})",
+                        callback_data=f"onzs_not_done_{number}",
+                    )
+                ]
+            ]
+        )
+        await query.message.reply_text(
+            f"Для ОНзС {number} можно показать только строки, где статус «нет».",
+            reply_markup=kb,
+        )
         return
 
-    # ---------- ИНСПЕКТОР ----------
+    if data.startswith("onzs_not_done_"):
+        number = data.replace("onzs_not_done_", "")
+        df = get_remarks_df_current()
+        if df is None:
+            await query.message.reply_text(
+                "Не удалось получить файл замечаний. Проверьте доступ к таблице."
+            )
+            return
+        text = build_remarks_not_done_by_onzs(df, number)
+        await send_long_text(query.message.chat, text)
+        return
+
+    # --- ИНСПЕКТОР ---
     if data == "inspector_add":
         context.user_data["inspector_form"] = {"step": "date"}
         await query.message.reply_text(
-            "👮‍♂️ Новый выезд инспектора\n\n"
+            "👮‍♂️ Выезд инспектора\n\n"
             "Укажем данные по шагам.\n"
             "1/8. Дата выезда (ДД.ММ.ГГГГ):"
         )
@@ -1530,7 +2105,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "inspector_list":
         rows = fetch_inspector_visits(limit=50)
         text = build_inspector_list_text(rows)
-        await send_long_text(query.message.chat, text)
+        await send_long_text(query.message.chat, "\n".join(text.split("\n")))
         return
 
     if data == "inspector_download":
@@ -1540,58 +2115,166 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---------- ИТОГОВЫЕ ПРОВЕРКИ ----------
-    if data == "final_download":
-        # отправляем локальный файл целиком
-        if not os.path.exists(FINAL_CHECKS_LOCAL_PATH):
-            if not refresh_final_checks_local_file():
-                await query.message.reply_text(
-                    "Не удалось получить файл итоговых проверок."
-                )
-                return
-        try:
-            with open(FINAL_CHECKS_LOCAL_PATH, "rb") as f:
-                bio = BytesIO(f.read())
-            bio.seek(0)
-            filename = f"Итоговые_проверки_{date.today().strftime('%d.%m.%Y')}.xlsx"
-            await context.bot.send_document(
-                chat_id=query.message.chat.id,
-                document=InputFile(bio, filename=filename),
-                caption="Полный файл итоговых проверок",
-            )
-        except Exception as e:
-            log.error("Ошибка отправки файла итоговых проверок: %s", e)
-            await query.message.reply_text(
-                "Ошибка при отправке файла итоговых проверок."
-            )
-        return
-
-    if data in ("final_week", "final_month"):
-        df = get_final_checks_df()
-        if df is None:
-            await query.message.reply_text(
-                "Не удалось прочитать файл итоговых проверок."
-            )
-            return
-
-        days = 7 if data == "final_week" else 30
-        df_sub = filter_final_checks_by_period(df, days)
-        period_text = "последнюю неделю" if data == "final_week" else "последний месяц"
-
-        if df_sub.empty:
-            await query.message.reply_text(
-                f"За {period_text} итоговые проверки не найдены."
-            )
-            return
-
-        await send_final_checks_subset(
-            chat_id=query.message.chat.id,
-            dataframe=df_sub,
-            caption=f"Итоговые проверки за {period_text}",
-            context=context,
+    if data == "inspector_reset":
+        clear_inspector_visits()
+        await query.message.reply_text(
+            "Список выездов инспектора очищен.\n"
+            "Новые выезды будут попадать в Excel после добавления через кнопку «➕ Добавить выезд»."
         )
         return
 
+    # --- ИТОГОВЫЕ ПРОВЕРКИ ---
+    if data == "final_week":
+        # запоминаем режим и спрашиваем, по какой дате фильтровать
+        context.user_data["final_range_choice"] = {"mode": "week"}
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📌 По дате начала (O)", callback_data="final_basis_start"
+                    ),
+                    InlineKeyboardButton(
+                        "📌 По дате окончания (P)", callback_data="final_basis_end"
+                    ),
+                ]
+            ]
+        )
+        await query.message.reply_text(
+            "За неделю: по какой дате фильтровать?\n\n"
+            "• O — дата начала итоговой проверки\n"
+            "• P — дата окончания итоговой проверки",
+            reply_markup=kb,
+        )
+        return
+
+    if data == "final_month":
+        context.user_data["final_range_choice"] = {"mode": "month"}
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📌 По дате начала (O)", callback_data="final_basis_start"
+                    ),
+                    InlineKeyboardButton(
+                        "📌 По дате окончания (P)", callback_data="final_basis_end"
+                    ),
+                ]
+            ]
+        )
+        await query.message.reply_text(
+            "За месяц: по какой дате фильтровать?\n\n"
+            "• O — дата начала итоговой проверки\n"
+            "• P — дата окончания итоговой проверки",
+            reply_markup=kb,
+        )
+        return
+
+    if data == "final_period":
+        context.user_data["final_range_choice"] = {"mode": "period"}
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📌 По дате начала (O)", callback_data="final_basis_start"
+                    ),
+                    InlineKeyboardButton(
+                        "📌 По дате окончания (P)", callback_data="final_basis_end"
+                    ),
+                ]
+            ]
+        )
+        await query.message.reply_text(
+            "Выбор периода: по какой дате фильтровать?\n\n"
+            "• O — дата начала итоговой проверки\n"
+            "• P — дата окончания итоговой проверки",
+            reply_markup=kb,
+        )
+        return
+
+    # выбор базы: O или P
+    if data in ("final_basis_start", "final_basis_end"):
+        basis = "start" if data == "final_basis_start" else "end"
+        state = context.user_data.get("final_range_choice")
+        if not state:
+            await query.message.reply_text(
+                "Сначала выберите режим (за неделю/за месяц/выбрать период) в разделе «Итоговые проверки»."
+            )
+            return
+
+        mode = state.get("mode")
+        # недельный и месячный режимы
+        if mode in ("week", "month"):
+            df = get_final_checks_df()
+            if df is None:
+                await query.message.reply_text(
+                    "Не удалось открыть таблицу итоговых проверок."
+                )
+                context.user_data.pop("final_range_choice", None)
+                return
+
+            today = local_now().date()
+            if mode == "week":
+                start = today - timedelta(days=7)
+                end = today
+                mode_text = "за неделю"
+            else:
+                start = today - timedelta(days=30)
+                end = today
+                mode_text = "за месяц"
+
+            basis_text = (
+                "по дате начала (O)" if basis == "start" else "по дате окончания (P)"
+            )
+
+            header = (
+                f"📋 Итоговые проверки {mode_text} {basis_text}\n"
+                f"{start:%d.%m.%Y} — {end:%d.%m.%Y}"
+            )
+            text_out = build_final_checks_text_filtered(
+                df,
+                start_date=start,
+                end_date=end,
+                header=header,
+                basis=basis,
+            )
+            await send_long_text(query.message.chat, text_out)
+            await send_final_checks_xlsx_filtered(
+                chat_id=query.message.chat.id,
+                df=df,
+                context=context,
+                start_date=start,
+                end_date=end,
+                basis=basis,
+            )
+            context.user_data.pop("final_range_choice", None)
+            return
+
+        # пользовательский период
+        if mode == "period":
+            context.user_data["final_period"] = {
+                "step": "start",
+                "basis": basis,
+            }
+            context.user_data.pop("final_range_choice", None)
+            await query.message.reply_text(
+                "Введите дату начала периода (ДД.ММ.ГГГГ):"
+            )
+            return
+
+        # на всякий случай
+        context.user_data.pop("final_range_choice", None)
+        await query.message.reply_text(
+            "Что-то пошло не так. Попробуйте ещё раз выбрать режим."
+        )
+        return
+
+    if data == "final_search_case":
+        context.user_data["awaiting_final_case_search"] = True
+        await query.message.reply_text(
+            "Введите номер дела (формат 00-00-000000), который нужно найти "
+            "в итоговых проверках:"
+        )
+        return
 
 
 # -------------------------------------------------
@@ -1601,12 +2284,92 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     chat = update.message.chat
 
-    # --- СНАЧАЛА мастер «Инспектор» ---
+    # Инспектор — пошаговый мастер
     if "inspector_form" in context.user_data:
         await inspector_process(update, context)
         return
 
-    # комментарий к "На доработку"
+    # Итоговые проверки — пользовательский период
+    if context.user_data.get("final_period"):
+        period = context.user_data["final_period"]
+        step = period.get("step")
+        basis = period.get("basis", "any")
+
+        # ШАГ 1: ввод даты начала
+        if step == "start":
+            try:
+                start_date = datetime.strptime(text, "%d.%m.%Y").date()
+                if start_date.year < 2000 or start_date.year > 2100:
+                    raise ValueError("year out of range")
+
+                period["start_date"] = start_date
+                period["step"] = "end"
+                context.user_data["final_period"] = period
+                await update.message.reply_text(
+                    "Введите дату окончания периода (ДД.ММ.ГГГГ):"
+                )
+            except Exception:
+                await update.message.reply_text(
+                    "Дата начала в неверном формате.\n"
+                    "Введите в виде ДД.ММ.ГГГГ (например, 05.01.2025)."
+                )
+            return
+
+        # ШАГ 2: ввод даты окончания
+        if step == "end":
+            try:
+                end_date = datetime.strptime(text, "%d.%m.%Y").date()
+                if end_date.year < 2000 or end_date.year > 2100:
+                    raise ValueError("year out of range")
+
+                start_date = period.get("start_date")
+                if start_date and end_date < start_date:
+                    await update.message.reply_text(
+                        "Дата окончания раньше даты начала.\n"
+                        "Введите корректную дату окончания (ДД.ММ.ГГГГ)."
+                    )
+                    return
+
+                df = get_final_checks_df()
+                if df is None:
+                    await update.message.reply_text(
+                        "Не удалось открыть таблицу итоговых проверок."
+                    )
+                    context.user_data.pop("final_period", None)
+                    return
+
+                basis_text = (
+                    "по дате начала (O)" if basis == "start" else "по дате окончания (P)"
+                )
+                header = (
+                    f"📋 Итоговые проверки {basis_text} "
+                    f"за период {start_date:%d.%m.%Y} — {end_date:%d.%m.%Y}"
+                )
+                text_out = build_final_checks_text_filtered(
+                    df,
+                    start_date=start_date,
+                    end_date=end_date,
+                    header=header,
+                    basis=basis,
+                )
+                await send_long_text(chat, text_out)
+                await send_final_checks_xlsx_filtered(
+                    chat_id=chat.id,
+                    df=df,
+                    context=context,
+                    start_date=start_date,
+                    end_date=end_date,
+                    basis=basis,
+                )
+                context.user_data.pop("final_period", None)
+            except Exception:
+                await update.message.reply_text(
+                    "Дата окончания в неверном формате.\n"
+                    "Введите в виде ДД.ММ.ГГГГ (например, 12.12.2025)."
+                )
+            return
+
+    # Комментарий к доработке графика
     if context.user_data.get("awaiting_rework_comment"):
         info = context.user_data.pop("awaiting_rework_comment")
         version = info["version"]
@@ -1618,13 +2381,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ввод списка согласующих
+    # Ввод списка согласующих
     if context.user_data.get("awaiting_approvers_input"):
         info = context.user_data.pop("awaiting_approvers_input")
         version = info["version"]
 
         raw = text.replace(",", " ").split()
-        approvers = []
+        approvers: List[str] = []
         for token in raw:
             token = token.strip()
             if not token:
@@ -1664,80 +2427,91 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         )
 
-        await chat.send_message("\n".join(lines), reply_markup=kb)
+        text_to_send = "\n".join(lines)
+
+        await chat.send_message(text_to_send, reply_markup=kb)
+
+        if SCHEDULE_NOTIFY_CHAT_ID is not None:
+            try:
+                await context.bot.send_message(
+                    chat_id=SCHEDULE_NOTIFY_CHAT_ID,
+                    text=text_to_send,
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                log.error(
+                    "Не удалось отправить уведомление в чат SCHEDULE_NOTIFY_CHAT_ID=%s: %s",
+                    SCHEDULE_NOTIFY_CHAT_ID,
+                    e,
+                )
+
         await update.message.reply_text("Согласующие сохранены и уведомлены.")
+        return
+
+    # Поиск по номеру дела в замечаниях
+    if context.user_data.get("awaiting_case_search"):
+        context.user_data.pop("awaiting_case_search", None)
+        case_no = text.strip()
+        df = get_remarks_df_current()
+        if df is None:
+            await update.message.reply_text(
+                "Не удалось открыть файл замечаний. Проверьте доступ к таблице."
+            )
+            return
+        out_text = build_case_cards_text(df, case_no)
+        await send_long_text(chat, out_text)
+        return
+
+    # Поиск по номеру дела в итоговых проверках
+    if context.user_data.get("awaiting_final_case_search"):
+        context.user_data.pop("awaiting_final_case_search", None)
+        case_no = text.strip()
+        df = get_final_checks_df()
+        if df is None:
+            await update.message.reply_text(
+                "Не удалось открыть таблицу итоговых проверок."
+            )
+            return
+        header = f"📋 Итоговые проверки по номеру дела: {case_no}"
+        text_out = build_final_checks_text_filtered(
+            df, case_no=case_no, header=header
+        )
+        await send_long_text(chat, text_out)
+        await send_final_checks_xlsx_filtered(
+            chat_id=chat.id, df=df, context=context, case_no=case_no
+        )
         return
 
     low = text.lower()
 
-    # --------- Разделы главного меню ---------
     if low == "📅 график".lower():
         settings = get_schedule_state()
         is_adm = is_admin(update.effective_user.id)
         msg = build_schedule_text(is_adm, settings)
-        kb = build_schedule_inline(is_adm, settings)
+        user_username = update.effective_user.username or ""
+        user_tag = f"@{user_username}" if user_username else None
+        kb = build_schedule_inline(is_adm, settings, user_tag=user_tag)
         msg_full = (
             "📅 Раздел «График выездов»\n\n"
             "• Смотреть текущий статус согласования\n"
             "• Обновить данные из общей таблицы\n"
-            "• Скачать красивый Excel-файл\n\n"
+            "• Скачать красиво оформленный Excel-файл\n\n"
+            "Если вы входите в список согласующих, ниже будут кнопки "
+            "«Согласовать» и «На доработку».\n\n"
             f"{msg}"
         )
         await update.message.reply_text(msg_full, reply_markup=kb)
-        return
-
-    if low == "📊 итоговая".lower():
-        # каждый заход в раздел «Итоговые проверки» обновляем локальный файл
-        ok = refresh_final_checks_local_file()
-        if not ok:
-            await update.message.reply_text(
-                "Не удалось обновить файл итоговых проверок. "
-                "Проверьте доступ к таблице или попробуйте позже."
-            )
-            return
-
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "📅 За неделю", callback_data="final_week"
-                    ),
-                    InlineKeyboardButton(
-                        "📆 За месяц", callback_data="final_month"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "📥 Скачать файл целиком", callback_data="final_download"
-                    )
-                ],
-            ]
-        )
-        msg = (
-            "📊 Раздел «Итоговые проверки»\n\n"
-            "Файл с итоговыми проверками обновлён.\n"
-            "Выберите период или скачайте файл целиком:"
-        )
-        await update.message.reply_text(msg, reply_markup=kb)
         return
 
     if low == "📝 замечания".lower():
         kb = remarks_menu_inline()
         msg = (
             "📝 Раздел «Замечания»\n\n"
-            "• Показать строки, где статус «нет» (не устранены)\n"
-            "• Открыть файл с замечаниями и графиком\n\n"
+            "Здесь доступны:\n"
+            "• 🔎 поиск по номеру дела (столбец I);\n"
+            "• 🏗 ОНзС — выбор 1–12, список дел (Номер дела (I) + адрес) и отдельный просмотр неустранённых;\n"
+            "• 📥 открыть общий файл таблицы.\n\n"
             "Выберите нужное действие:"
-        )
-        await update.message.reply_text(msg, reply_markup=kb)
-        return
-
-    if low == "🏗 онзс".lower():
-        kb = onzs_menu_inline()
-        msg = (
-            "🏗 Раздел «ОНзС»\n\n"
-            "Выберите номер ОНзС, чтобы увидеть объекты и номера дел "
-            "из текущего файла замечаний."
         )
         await update.message.reply_text(msg, reply_markup=kb)
         return
@@ -1747,9 +2521,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = (
             "👮‍♂️ Раздел «Инспектор»\n\n"
             "Здесь можно:\n"
-            "• ➕ добавить новый выезд;\n"
+            "• ➕ добавить выезд инспектора;\n"
             "• 📋 посмотреть последние выезды;\n"
-            "• 📥 скачать отдельный Excel с выездами.\n\n"
+            "• 📥 скачать отдельный Excel с выездами;\n"
+            "• 🔄 обнулить список выездов (кнопка «Обновить»).\n\n"
             "Выберите действие кнопками ниже."
         )
         await update.message.reply_text(msg, reply_markup=kb)
@@ -1803,7 +2578,20 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_text(chat, "\n".join(lines))
         return
 
-    # дефолт
+    if low == "итоговые проверки":
+        kb = final_checks_menu_inline()
+        msg = (
+            "📋 Раздел «Итоговые проверки»\n\n"
+            "Вы можете:\n"
+            "• посмотреть проверки за последнюю неделю;\n"
+            "• за последний месяц;\n"
+            "• указать свой период дат;\n"
+            "• выполнить поиск по номеру дела.\n\n"
+            "Выберите нужный вариант кнопками ниже."
+        )
+        await update.message.reply_text(msg, reply_markup=kb)
+        return
+
     await update.message.reply_text(
         "Я вас не понял. Выберите пункт меню или нажмите /start.",
         reply_markup=main_menu(),
@@ -1827,10 +2615,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Добро пожаловать в бота отдела СОТ.\n\n"
         "Основные разделы:\n"
         "• 📅 График — согласование графика выездов\n"
-        "• 📝 Замечания — лист ПБ, АР, ММГН, АГО\n"
-        "• 📊 Итоговая — итоговые проверки\n"
-        "• 🏗 ОНзС — объекты по номерам ОНзС\n"
+        "• 📝 Замечания — поиск по номеру дела, ОНзС и статусы «нет»\n"
         "• Инспектор — выезды инспектора\n"
+        "• Итоговые проверки — перечень итоговых проверок по отдельной таблице\n"
         "• 📈 Аналитика — история согласований\n\n"
         "Выберите раздел с помощью кнопок ниже."
     )
@@ -1840,11 +2627,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "Справка по боту СОТ:\n\n"
-        "📅 График — показать статус согласования, скачать Excel.\n"
-        "📝 Замечания — искать не устранённые «нет» и открыть файл.\n"
-        "📊 Итоговая — список итоговых проверок (упрощённо).\n"
-        "🏗 ОНзС — объекты по каждому номеру ОНзС.\n"
+        "📅 График — показать статус согласования, обновить, скачать Excel.\n"
+        "📝 Замечания — поиск по номеру дела (I), работа с ОНзС и просмотр статусов «нет».\n"
         "Инспектор — добавление и выгрузка выездов инспектора.\n"
+        "Итоговые проверки — список и выгрузка итоговых проверок за период или по делу.\n"
         "📈 Аналитика — история согласований по версиям графика.\n"
     )
     await update.message.reply_text(msg, reply_markup=main_menu())
