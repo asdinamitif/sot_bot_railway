@@ -116,7 +116,6 @@ FINAL_CHECKS_LOCAL_PATH = os.getenv(
 ).strip()
 
 
-
 def is_admin(uid: int) -> bool:
     return uid in HARD_CODED_ADMINS
 
@@ -1434,21 +1433,73 @@ def _parse_final_date(val) -> Optional[date]:
     """
     Преобразует значение из столбцов O/P в дату.
     Поддерживает текстовые и «экселевские» даты.
+    Всегда возвращает либо datetime.date, либо None
+    (NaT, пустые и некорректные значения превращаются в None).
     """
     if val is None:
         return None
+
+    # Обрабатываем pandas NaT/NaN как отсутствие даты
     try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+
+    try:
+        # Уже дата/датавремя
         if isinstance(val, (datetime, pd.Timestamp)):
-            return val.date()
-        if isinstance(val, (int, float)) and not pd.isna(val):
+            d = val.date()
+            try:
+                if pd.isna(d):
+                    return None
+            except Exception:
+                pass
+            return d
+        if isinstance(val, date):
+            try:
+                if pd.isna(val):
+                    return None
+            except Exception:
+                pass
+            return val
+
+        # Чистый числовой серийный номер Excel
+        if isinstance(val, (int, float)):
             dt = pd.to_datetime(val, errors="coerce")
+            try:
+                if pd.isna(dt):
+                    return None
+            except Exception:
+                pass
             if isinstance(dt, (datetime, pd.Timestamp)):
-                return dt.date()
+                d = dt.date()
+                try:
+                    if pd.isna(d):
+                        return None
+                except Exception:
+                    pass
+                return d
+            return None
+
+        # Строковое представление
         dt = pd.to_datetime(str(val), dayfirst=True, errors="coerce")
+        try:
+            if pd.isna(dt):
+                return None
+        except Exception:
+            pass
         if isinstance(dt, (datetime, pd.Timestamp)):
-            return dt.date()
+            d = dt.date()
+            try:
+                if pd.isna(d):
+                    return None
+            except Exception:
+                pass
+            return d
     except Exception:
         return None
+
     return None
 
 
@@ -1459,6 +1510,12 @@ def filter_final_checks_df(
     case_no: Optional[str] = None,
     basis: str = "any",  # "start" -> только O, "end" -> только P, "any" -> O или P
 ) -> pd.DataFrame:
+    """
+    Фильтрация итоговых проверок:
+    - по периоду дат (start_date / end_date) с учётом выбранной базы (O / P / любая);
+    - по номеру дела (столбец B).
+    Все битые/пустые даты (NaT, некорректные серийные номера и т.п.) отбрасываются.
+    """
     idx_case = excel_col_to_index("B")
     idx_start = excel_col_to_index("O")
     idx_end = excel_col_to_index("P")
@@ -1502,10 +1559,29 @@ def filter_final_checks_df(
             elif basis == "end":
                 base = d_end
             else:  # "any"
-                base = d_start or d_end
+                base = d_start if d_start is not None else d_end
 
-            if base is None or base < start_date or base > end_date:
+            if base is None:
                 include = False
+            else:
+                # На всякий случай приводим к типу date
+                if isinstance(base, pd.Timestamp):
+                    base_date = base.date()
+                elif isinstance(base, datetime):
+                    base_date = base.date()
+                else:
+                    base_date = base
+
+                # Ещё раз защищаемся от NaT / NaN
+                try:
+                    if pd.isna(base_date):
+                        include = False
+                    else:
+                        if base_date < start_date or base_date > end_date:
+                            include = False
+                except TypeError:
+                    # Несравнимые типы — просто исключаем строку
+                    include = False
 
         mask.append(include)
 
@@ -1912,7 +1988,7 @@ def build_inspector_list_text(rows: List[sqlite3.Row]) -> str:
     for r in rows:
         d = r["date"] or ""
         try:
-            d_fmt = datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y")
+            d_fmt = datetime.strptime(d, "%Y-%m-%d").strftime("%d.%м.%Y")
         except Exception:
             d_fmt = d
         lines.append(
@@ -1969,7 +2045,7 @@ async def send_inspector_xlsx(
         df.to_excel(writer, sheet_name="Инспектор", index=False)
 
     bio.seek(0)
-    filename = f"Инспектор_выезды_{date.today().strftime('%d.%m.%Y')}.xlsx"
+    filename = f"Инспектор_выезды_{date.today().strftime('%d.%м.%Y')}.xlsx"
 
     await context.bot.send_document(
         chat_id=chat_id,
@@ -2295,7 +2371,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             header = (
                 f"📋 Итоговые проверки {mode_text} {basis_text}\n"
-                f"{start:%d.%m.%Y} — {end:%d.%m.%Y}"
+                f"{start:%d.%м.%Y} — {end:%d.%м.%Y}"
             )
             text_out = build_final_checks_text_filtered(
                 df,
@@ -2365,7 +2441,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ШАГ 1: ввод даты начала
         if step == "start":
             try:
-                start_date = datetime.strptime(text, "%d.%m.%Y").date()
+                start_date = datetime.strptime(text, "%d.%м.%Y").date()
                 if start_date.year < 2000 or start_date.year > 2100:
                     raise ValueError("year out of range")
 
@@ -2385,7 +2461,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ШАГ 2: ввод даты окончания
         if step == "end":
             try:
-                end_date = datetime.strptime(text, "%d.%m.%Y").date()
+                end_date = datetime.strptime(text, "%d.%м.%Y").date()
                 if end_date.year < 2000 or end_date.year > 2100:
                     raise ValueError("year out of range")
 
@@ -2410,7 +2486,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 header = (
                     f"📋 Итоговые проверки {basis_text} "
-                    f"за период {start_date:%d.%m.%Y} — {end_date:%d.%m.%Y}"
+                    f"за период {start_date:%d.%м.%Y} — {end_date:%d.%м.%Y}"
                 )
                 text_out = build_final_checks_text_filtered(
                     df,
