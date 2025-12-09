@@ -1426,8 +1426,9 @@ def filter_final_checks_df(
         start_ts = pd.Timestamp(start_date)
         end_ts = pd.Timestamp(end_date)
 
-        def _make_date_series(col_idx):
-            if col_idx is None or col_idx >= df2.shape[1] or col_idx < 0:
+        def _make_date_series(col_idx: Optional[int]) -> pd.Series:
+            """Преобразует столбец в Series с Timestamp или NaT."""
+            if col_idx is None or col_idx < 0 or col_idx >= df2.shape[1]:
                 return pd.Series(pd.NaT, index=df2.index)
 
             s = df2.iloc[:, col_idx]
@@ -1436,15 +1437,19 @@ def filter_final_checks_df(
             if pd.api.types.is_datetime64_any_dtype(s):
                 return s
 
-            # Чисто числовые значения (возможные "экселевские" даты)
+            # Числовые значения (возможные экселевские даты)
             if pd.api.types.is_numeric_dtype(s):
                 # пробуем как "excel serial" (дни с 1899-12-30)
-                dt = pd.to_datetime(s, origin="1899-12-30", unit="D", errors="coerce")
-                return dt
+                return pd.to_datetime(s, origin="1899-12-30", unit="D", errors="coerce")
 
             # Всё остальное — как строки
             s_str = s.astype(str).str.strip()
-            dt = pd.to_datetime(s_str, dayfirst=True, errors="coerce")
+            # Убираем лишние символы типа " г."
+            s_clean = s_str.str.replace(r"[^0-9\.]", "", regex=True)
+            dt = pd.to_datetime(s_clean, format="%d.%m.%Y", errors="coerce")
+            # если вообще ничего не распозналось в формате, пробуем общий парсер
+            if dt.isna().all():
+                dt = pd.to_datetime(s_str, dayfirst=True, errors="coerce")
             return dt
 
         s_start = _make_date_series(idx_start)
