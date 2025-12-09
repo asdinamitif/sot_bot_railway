@@ -1368,22 +1368,37 @@ def _parse_final_date(val) -> Optional[date]:
     Преобразует значение из столбцов O/P в дату.
     Поддерживает текстовые и «экселевские» даты.
     """
+    # Пустые и NaT сразу отбрасываем
     if val is None:
         return None
     try:
+        # Явный NaT от pandas
+        if isinstance(val, pd.Timestamp) and pd.isna(val):
+            return None
+
+        # Уже datetime / Timestamp
         if isinstance(val, (datetime, pd.Timestamp)):
-            return val.date()
+            if pd.isna(val):
+                return None
+            d = val.date()
+            # защита от NaT, который "просочился" через .date()
+            if isinstance(d, date):
+                return d
+            return None
+
+        # Чисто числовые "экселевские" даты
         if isinstance(val, (int, float)) and not pd.isna(val):
             dt = pd.to_datetime(val, errors="coerce")
-            if isinstance(dt, (datetime, pd.Timestamp)):
+            if isinstance(dt, (datetime, pd.Timestamp)) and not pd.isna(dt):
                 return dt.date()
+
+        # Текстовые даты
         dt = pd.to_datetime(str(val), dayfirst=True, errors="coerce")
-        if isinstance(dt, (datetime, pd.Timestamp)):
+        if isinstance(dt, (datetime, pd.Timestamp)) and not pd.isna(dt):
             return dt.date()
     except Exception:
         return None
     return None
-
 
 def filter_final_checks_df(
     df: pd.DataFrame,
