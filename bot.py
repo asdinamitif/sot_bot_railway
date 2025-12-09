@@ -250,6 +250,26 @@ def normalize_onzs_value(val) -> Optional[str]:
     return s
 
 
+def normalize_case_number(val) -> str:
+    """
+    Нормализует номер дела:
+    - убирает пробелы;
+    - приводит все «нестандартные» дефисы к обычному '-'.
+    """
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if not s:
+        return ""
+    # разные виды тире/дефисов → обычный дефис
+    hyphens = ["\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212"]
+    for h in hyphens:
+        s = s.replace(h, "-")
+    # убираем пробелы
+    s = s.replace(" ", "")
+    return s
+
+
 # -------------------------------------------------
 # БАЗА ДАННЫХ (график + согласование + инспектор)
 # -------------------------------------------------
@@ -1174,6 +1194,8 @@ def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
     if not case_no:
         return "Номер дела не указан."
 
+    target = normalize_case_number(case_no)
+
     # Индексы основных столбцов
     idx_case = get_col_index_by_header(df, "номер дела", "I")
     if idx_case is None:
@@ -1197,10 +1219,11 @@ def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
     mask: List[bool] = []
     for _, row in df.iterrows():
         try:
-            val = str(row.iloc[idx_case]).strip()
+            val_raw = row.iloc[idx_case]
         except Exception:
-            val = ""
-        mask.append(val == case_no)
+            val_raw = None
+        val_norm = normalize_case_number(val_raw)
+        mask.append(val_norm == target)
 
     if not any(mask):
         return f"По номеру дела {case_no} ничего не найдено.\nЛист: {sheet_name}"
@@ -1215,6 +1238,7 @@ def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
     ]
 
     for _, row in df_sel.iterrows():
+
         def safe(idx: Optional[int]) -> str:
             if idx is None:
                 return ""
@@ -1389,7 +1413,7 @@ async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if step == "date":
         try:
-            form["date"] = datetime.strptime(text, "%d.%м.%Y").date()
+            form["date"] = datetime.strptime(text, "%d.%m.%Y").date()
             form["step"] = "area"
             context.user_data["inspector_form"] = form
             await update.message.reply_text("1/8. Площадь объекта (кв.м):")
@@ -1530,23 +1554,38 @@ def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
 
     lines = [f"ОНзС = {number}", f"Найдено дел: {len(df_f)}", ""]
 
+    # аккуратно читаем значения, убирая NaN/пустые
     for _, row in df_f.iterrows():
+
         def safe(idx: Optional[int]) -> str:
             if idx is None:
                 return ""
             try:
-                return str(row.iloc[idx]).strip()
+                val = row.iloc[idx]
             except Exception:
                 return ""
+            try:
+                if pd.isna(val):
+                    return ""
+            except Exception:
+                pass
+            s = str(val).strip()
+            if not s or s.lower() == "nan":
+                return ""
+            return s
 
         case_no = safe(case_idx)
         addr = safe(addr_idx)
+
+        # если вообще ничего нет — не выводим строку
+        if not case_no and not addr:
+            continue
 
         if case_no and addr:
             lines.append(f"• {case_no} — {addr}")
         elif case_no:
             lines.append(f"• {case_no}")
-        elif addr:
+        else:
             lines.append(f"• {addr}")
 
     return "\n".join(lines)
