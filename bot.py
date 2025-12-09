@@ -1434,42 +1434,21 @@ def _parse_final_date(val) -> Optional[date]:
     """
     Преобразует значение из столбцов O/P в дату.
     Поддерживает текстовые и «экселевские» даты.
-    Всегда возвращает обычный объект date или None,
-    никогда не возвращает pandas.NaT.
     """
     if val is None:
         return None
-
-    # Явно отбрасываем NaT/NaN
     try:
-        if pd.isna(val):
-            return None
-    except TypeError:
-        # для скаляров, где pd.isna не применим
-        pass
-
-    try:
-        # Уже готовый datetime/pandas.Timestamp (включая NaT)
         if isinstance(val, (datetime, pd.Timestamp)):
-            if pd.isna(val):
-                return None
             return val.date()
-
-        # Числовые "экселевские" даты
-        if isinstance(val, (int, float)):
-            if pd.isna(val):
-                return None
+        if isinstance(val, (int, float)) and not pd.isna(val):
             dt = pd.to_datetime(val, errors="coerce")
-            if isinstance(dt, (datetime, pd.Timestamp)) and not pd.isna(dt):
+            if isinstance(dt, (datetime, pd.Timestamp)):
                 return dt.date()
-
-        # Текстовые даты
         dt = pd.to_datetime(str(val), dayfirst=True, errors="coerce")
-        if isinstance(dt, (datetime, pd.Timestamp)) and not pd.isna(dt):
+        if isinstance(dt, (datetime, pd.Timestamp)):
             return dt.date()
     except Exception:
         return None
-
     return None
 
 
@@ -1480,6 +1459,20 @@ def filter_final_checks_df(
     case_no: Optional[str] = None,
     basis: str = "any",  # "start" -> только O, "end" -> только P, "any" -> O или P
 ) -> pd.DataFrame:
+    """
+    Универсальный фильтр итоговых проверок:
+    - по периоду (O / P в зависимости от basis);
+    - по номеру дела.
+    Работает в связке с кнопками:
+      • За неделю / За месяц (basis = "start" или "end");
+      • Выбрать период;
+      • По номеру дела.
+    """
+    if df is None or df.empty:
+        return df.iloc[0:0].copy()
+
+    # Индексы колонок в итоговой таблице:
+    # B — номер дела, O — дата начала, P — дата окончания
     idx_case = excel_col_to_index("B")
     idx_start = excel_col_to_index("O")
     idx_end = excel_col_to_index("P")
@@ -1488,53 +1481,66 @@ def filter_final_checks_df(
     if basis not in ("start", "end", "any"):
         basis = "any"
 
-    case_filter_norm = normalize_case_number(case_no) if case_no else None
+    result = df.copy()
 
-    mask: List[bool] = []
-    for _, row in df.iterrows():
-        include = True
+    # ---------- Фильтр по номеру дела ----------
+    if case_no:
+        case_filter_norm = normalize_case_number(case_no)
+        if not case_filter_norm:
+            return result.iloc[0:0].copy()
 
-        # --- фильтр по номеру дела ---
-        if case_filter_norm:
-            try:
-                case_val = row.iloc[idx_case]
-            except Exception:
-                case_val = None
-            val_norm = normalize_case_number(case_val)
-            if not val_norm or val_norm != case_filter_norm:
-                include = False
+        try:
+            ser_case = result.iloc[:, idx_case]
+        except Exception:
+            # если вдруг нет колонки B — возвращаем пустой df
+            return result.iloc[0:0].copy()
 
-        # --- фильтр по периоду ---
-        if include and start_date and end_date:
-            try:
-                s_raw = row.iloc[idx_start]
-            except Exception:
-                s_raw = None
-            try:
-                e_raw = row.iloc[idx_end]
-            except Exception:
-                e_raw = None
+        def _norm(v):
+            return normalize_case_number(v)
 
-            d_start = _parse_final_date(s_raw)
-            d_end = _parse_final_date(e_raw)
+        mask_case = ser_case.apply(lambda v: _norm(v) == case_filter_norm)
+        result = result[mask_case]
 
-            if basis == "start":
-                base = d_start
-            elif basis == "end":
-                base = d_end
-            else:  # "any"
-                base = d_start or d_end
+        if result.empty:
+            return result
 
-            if base is None or base < start_date or base > end_date:
-                include = False
+    # ---------- Фильтр по датам O/P ----------
+    if start_date or end_date:
+        # берём "сырые" значения из O и P
+        try:
+            ser_start_raw = result.iloc[:, idx_start]
+        except Exception:
+            ser_start_raw = pd.Series([None] * len(result), index=result.index)
 
-        mask.append(include)
+        try:
+            ser_end_raw = result.iloc[:, idx_end]
+        except Exception:
+            ser_end_raw = pd.Series([None] * len(result), index=result.index)
 
-    if not mask:
-        return df.iloc[0:0].copy()
+        # приводим каждое значение к date (или None)
+        ser_start = ser_start_raw.apply(_parse_final_date)
+        ser_end = ser_end_raw.apply(_parse_final_date)
 
-    df_f = df[mask].copy().reset_index(drop=True)
-    return df_f
+        # выбираем базовую дату для фильтра
+        if basis == "start":
+            base = ser_start
+        elif basis == "end":
+            base = ser_end
+        else:  # "any" — сначала O, если пусто, берём P
+            base = ser_start.where(ser_start.notna(), ser_end)
+
+        # переводим в Timestamp, чтобы можно было сравнивать диапазон
+        base_dt = pd.to_datetime(base, errors="coerce")
+
+        mask = pd.Series(True, index=result.index)
+        if start_date:
+            mask &= base_dt >= pd.to_datetime(start_date)
+        if end_date:
+            mask &= base_dt <= pd.to_datetime(end_date)
+
+        result = result[mask]
+
+    return result.reset_index(drop=True)
 
 
 def build_final_checks_text_filtered(
