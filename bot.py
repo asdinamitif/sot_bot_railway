@@ -2678,9 +2678,6 @@ if low == "итоговые проверки":
         await update.message.reply_text(msg, reply_markup=kb)
         return
 
-ыберите пункт меню или нажмите /start.",
-        reply_markup=main_menu(),
-    )
 
 
 # -------------------------------------------------
