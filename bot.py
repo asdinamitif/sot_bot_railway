@@ -2192,81 +2192,93 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # выбор базы: O или P
+    
+    # выбор базы: O или P
     if data in ("final_basis_start", "final_basis_end"):
-        basis = "start" if data == "final_basis_start" else "end"
-        state = context.user_data.get("final_range_choice")
-        if not state:
-            await query.message.reply_text(
-                "Сначала выберите режим (за неделю/за месяц/выбрать период) в разделе «Итоговые проверки»."
-            )
-            return
-
-        mode = state.get("mode")
-        # недельный и месячный режимы
-        if mode in ("week", "month"):
-            df = get_final_checks_df()
-            if df is None:
+        try:
+            basis = "start" if data == "final_basis_start" else "end"
+            state = context.user_data.get("final_range_choice")
+            if not state:
                 await query.message.reply_text(
-                    "Не удалось открыть таблицу итоговых проверок."
+                    "Сначала выберите режим (за неделю/за месяц/выбрать период) в разделе «Итоговые проверки»."
+                )
+                return
+
+            mode = state.get("mode")
+
+            # недельный и месячный режимы
+            if mode in ("week", "month"):
+                df = get_final_checks_df()
+                if df is None:
+                    await query.message.reply_text(
+                        "Не удалось открыть таблицу итоговых проверок."
+                    )
+                    context.user_data.pop("final_range_choice", None)
+                    return
+
+                today = local_now().date()
+                if mode == "week":
+                    start = today - timedelta(days=7)
+                    end = today
+                    mode_text = "за неделю"
+                else:
+                    start = today - timedelta(days=30)
+                    end = today
+                    mode_text = "за месяц"
+
+                basis_text = (
+                    "по дате начала (O)" if basis == "start" else "по дате окончания (P)"
+                )
+
+                header = (
+                    f"📋 Итоговые проверки {mode_text} {basis_text}\n"
+                    f"{start:%d.%m.%Y} — {end:%d.%m.%Y}"
+                )
+                text_out = build_final_checks_text_filtered(
+                    df,
+                    start_date=start,
+                    end_date=end,
+                    header=header,
+                    basis=basis,
+                )
+                await send_long_text(query.message.chat, text_out)
+                await send_final_checks_xlsx_filtered(
+                    chat_id=query.message.chat.id,
+                    df=df,
+                    context=context,
+                    start_date=start,
+                    end_date=end,
+                    basis=basis,
                 )
                 context.user_data.pop("final_range_choice", None)
                 return
 
-            today = local_now().date()
-            if mode == "week":
-                start = today - timedelta(days=7)
-                end = today
-                mode_text = "за неделю"
-            else:
-                start = today - timedelta(days=30)
-                end = today
-                mode_text = "за месяц"
+            # пользовательский период
+            if mode == "period":
+                context.user_data["final_period"] = {
+                    "step": "start",
+                    "basis": basis,
+                }
+                context.user_data.pop("final_range_choice", None)
+                await query.message.reply_text(
+                    "Введите дату начала периода (ДД.ММ.ГГГГ):"
+                )
+                return
 
-            basis_text = (
-                "по дате начала (O)" if basis == "start" else "по дате окончания (P)"
-            )
-
-            header = (
-                f"📋 Итоговые проверки {mode_text} {basis_text}\n"
-                f"{start:%d.%m.%Y} — {end:%d.%m.%Y}"
-            )
-            text_out = build_final_checks_text_filtered(
-                df,
-                start_date=start,
-                end_date=end,
-                header=header,
-                basis=basis,
-            )
-            await send_long_text(query.message.chat, text_out)
-            await send_final_checks_xlsx_filtered(
-                chat_id=query.message.chat.id,
-                df=df,
-                context=context,
-                start_date=start,
-                end_date=end,
-                basis=basis,
-            )
-            context.user_data.pop("final_range_choice", None)
-            return
-
-        # пользовательский период
-        if mode == "period":
-            context.user_data["final_period"] = {
-                "step": "start",
-                "basis": basis,
-            }
+            # на всякий случай
             context.user_data.pop("final_range_choice", None)
             await query.message.reply_text(
-                "Введите дату начала периода (ДД.ММ.ГГГГ):"
+                "Что-то пошло не так. Попробуйте ещё раз выбрать режим."
             )
             return
 
-        # на всякий случай
-        context.user_data.pop("final_range_choice", None)
-        await query.message.reply_text(
-            "Что-то пошло не так. Попробуйте ещё раз выбрать режим."
-        )
-        return
+        except Exception as e:
+            log.error("Ошибка обработки итоговых проверок (basis=%s): %s", basis, e)
+            await query.message.reply_text(
+                "Произошла ошибка при обработке итоговых проверок.\n"
+                "Сообщите разработчику и укажите, какую кнопку вы нажали."
+            )
+            return
 
     if data == "final_search_case":
         context.user_data["awaiting_final_case_search"] = True
@@ -2289,6 +2301,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await inspector_process(update, context)
         return
 
+    
     # Итоговые проверки — пользовательский период
     if context.user_data.get("final_period"):
         period = context.user_data["final_period"]
@@ -2330,38 +2343,49 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
 
-                df = get_final_checks_df()
-                if df is None:
-                    await update.message.reply_text(
-                        "Не удалось открыть таблицу итоговых проверок."
+                try:
+                    df = get_final_checks_df()
+                    if df is None:
+                        await update.message.reply_text(
+                            "Не удалось открыть таблицу итоговых проверок."
+                        )
+                        context.user_data.pop("final_period", None)
+                        return
+
+                    basis_text = (
+                        "по дате начала (O)"
+                        if basis == "start"
+                        else "по дате окончания (P)"
+                    )
+                    header = (
+                        f"📋 Итоговые проверки {basis_text} "
+                        f"за период {start_date:%d.%m.%Y} — {end_date:%d.%m.%Y}"
+                    )
+                    text_out = build_final_checks_text_filtered(
+                        df,
+                        start_date=start_date,
+                        end_date=end_date,
+                        header=header,
+                        basis=basis,
+                    )
+                    await send_long_text(chat, text_out)
+                    await send_final_checks_xlsx_filtered(
+                        chat_id=chat.id,
+                        df=df,
+                        context=context,
+                        start_date=start_date,
+                        end_date=end_date,
+                        basis=basis,
                     )
                     context.user_data.pop("final_period", None)
-                    return
-
-                basis_text = (
-                    "по дате начала (O)" if basis == "start" else "по дате окончания (P)"
-                )
-                header = (
-                    f"📋 Итоговые проверки {basis_text} "
-                    f"за период {start_date:%d.%m.%Y} — {end_date:%d.%m.%Y}"
-                )
-                text_out = build_final_checks_text_filtered(
-                    df,
-                    start_date=start_date,
-                    end_date=end_date,
-                    header=header,
-                    basis=basis,
-                )
-                await send_long_text(chat, text_out)
-                await send_final_checks_xlsx_filtered(
-                    chat_id=chat.id,
-                    df=df,
-                    context=context,
-                    start_date=start_date,
-                    end_date=end_date,
-                    basis=basis,
-                )
-                context.user_data.pop("final_period", None)
+                except Exception as e:
+                    log.error(
+                        "Ошибка формирования выборки итоговых проверок (period): %s", e
+                    )
+                    await update.message.reply_text(
+                        "Произошла внутренняя ошибка при обработке итоговых проверок.\n"
+                        "Сообщите разработчику."
+                    )
             except Exception:
                 await update.message.reply_text(
                     "Дата окончания в неверном формате.\n"
@@ -2369,7 +2393,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-    # Комментарий к доработке графика
+# Комментарий к доработке графика
     if context.user_data.get("awaiting_rework_comment"):
         info = context.user_data.pop("awaiting_rework_comment")
         version = info["version"]
