@@ -59,10 +59,8 @@ def _extract_spreadsheet_id_from_url(url: str) -> str:
     return ""
 
 
-# URL основной Google-таблицы
 SCHEDULE_URL_ENV = (os.getenv("SCHEDULE_URL") or "").strip()
 
-# ID таблицы
 _default_sheet_id = _extract_spreadsheet_id_from_url(SCHEDULE_URL_ENV)
 if not _default_sheet_id:
     _default_sheet_id = (os.getenv("GSHEETS_SPREADSHEET_ID") or "").strip()
@@ -71,7 +69,6 @@ if not _default_sheet_id:
 
 GSHEETS_SPREADSHEET_ID = _default_sheet_id
 
-# Ссылка на таблицу
 if SCHEDULE_URL_ENV:
     GOOGLE_SHEET_URL_DEFAULT = SCHEDULE_URL_ENV
 else:
@@ -80,7 +77,7 @@ else:
     )
 
 GSHEETS_SERVICE_ACCOUNT_JSON = (os.getenv("GSHEETS_SERVICE_ACCOUNT_JSON") or "").strip()
-SHEETS_SERVICE = None  # кеш клиента Google Sheets
+SHEETS_SERVICE = None
 
 DEFAULT_APPROVERS = [
     "@asdinamitif",
@@ -96,7 +93,7 @@ RESPONSIBLE_USERNAMES: Dict[str, List[str]] = {
     "смирнов": ["scri4"],
 }
 
-INSPECTOR_SHEET_NAME = "ПБ, АР,ММГН, АГО (2025)"  # лист для инспектора в общей книге
+INSPECTOR_SHEET_NAME = "ПБ, АР,ММГН, АГО (2025)"
 HARD_CODED_ADMINS = {398960707}
 
 SCHEDULE_NOTIFY_CHAT_ID_ENV = (os.getenv("SCHEDULE_NOTIFY_CHAT_ID") or "").strip()
@@ -216,15 +213,10 @@ def get_col_by_letter(df: pd.DataFrame, letters: str) -> Optional[str]:
 def get_col_index_by_header(
     df: pd.DataFrame, search_substr: str, fallback_letter: str
 ) -> Optional[int]:
-    """
-    Возвращает индекс столбца по части заголовка (без регистра),
-    при неудаче — индекс по букве столбца.
-    """
     search_substr = search_substr.lower()
     for i, col in enumerate(df.columns):
         if search_substr in str(col).lower():
             return i
-    # fallback по букве
     idx = excel_col_to_index(fallback_letter)
     if 0 <= idx < len(df.columns):
         return idx
@@ -232,16 +224,11 @@ def get_col_index_by_header(
 
 
 def normalize_onzs_value(val) -> Optional[str]:
-    """
-    Приводит значение ОНзС к строке без .0, пробелов и т.п.
-    6, 6.0, '6 ', '6.0'  -> '6'
-    """
     if val is None:
         return None
     s = str(val).strip()
     if not s:
         return None
-    # пробуем как число
     try:
         n = int(float(s.replace(",", ".")))
         return str(n)
@@ -251,27 +238,32 @@ def normalize_onzs_value(val) -> Optional[str]:
 
 
 def normalize_case_number(val) -> str:
-    """
-    Нормализует номер дела:
-    - убирает пробелы;
-    - приводит все «нестандартные» дефисы к обычному '-'.
-    """
     if val is None:
         return ""
     s = str(val).strip()
     if not s:
         return ""
-    # разные виды тире/дефисов → обычный дефис
     hyphens = ["\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212"]
     for h in hyphens:
         s = s.replace(h, "-")
-    # убираем пробелы
     s = s.replace(" ", "")
     return s
 
 
+def get_case_col_index(df: pd.DataFrame) -> Optional[int]:
+    """
+    Всегда стараемся брать «Номер дела (I)»:
+    - сначала жёстко берём колонку I по индексу;
+    - если по какой-то причине её нет, пробуем искать по заголовку.
+    """
+    idx_i = excel_col_to_index("I")
+    if 0 <= idx_i < len(df.columns):
+        return idx_i
+    return get_col_index_by_header(df, "номер дела", "I")
+
+
 # -------------------------------------------------
-# БАЗА ДАННЫХ (график + согласование + инспектор)
+# БАЗА ДАННЫХ
 # -------------------------------------------------
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -317,7 +309,6 @@ def init_db() -> None:
            )"""
     )
 
-    # Таблица выездов инспектора
     c.execute(
         """CREATE TABLE IF NOT EXISTS inspector_visits (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -445,9 +436,6 @@ def update_schedule_approval_status(
 # Инспектор: БД
 # -------------------------------------------------
 def save_inspector_to_db(form: Dict[str, Any]) -> bool:
-    """
-    Сохраняет выезд в локную таблицу inspector_visits.
-    """
     try:
         conn = get_db()
         c = conn.cursor()
@@ -494,9 +482,6 @@ def fetch_inspector_visits(limit: int = 50) -> List[sqlite3.Row]:
 
 
 def clear_inspector_visits() -> None:
-    """
-    Полностью очищает локную таблицу выездов инспектора.
-    """
     conn = get_db()
     c = conn.cursor()
     c.execute("DELETE FROM inspector_visits")
@@ -508,11 +493,6 @@ def clear_inspector_visits() -> None:
 # Клавиатуры
 # -------------------------------------------------
 def main_menu() -> ReplyKeyboardMarkup:
-    """
-    Главное меню:
-    📅 График     📝 Замечания
-    Инспектор     📈 Аналитика
-    """
     return ReplyKeyboardMarkup(
         [
             ["📅 График", "📝 Замечания"],
@@ -525,10 +505,6 @@ def main_menu() -> ReplyKeyboardMarkup:
 def build_schedule_inline(
     is_admin_flag: bool, settings: dict, user_tag: Optional[str] = None
 ) -> InlineKeyboardMarkup:
-    """
-    Кнопки для раздела «График», плюс при необходимости
-    личные кнопки согласования для текущего пользователя.
-    """
     buttons = [
         [
             InlineKeyboardButton("🔄 Обновить", callback_data="schedule_refresh"),
@@ -560,12 +536,6 @@ def build_schedule_inline(
 
 
 def remarks_menu_inline() -> InlineKeyboardMarkup:
-    """
-    Раздел «Замечания»:
-    - Поиск по номеру дела
-    - ОНзС (выбор 1–12, список дел, неустранённые)
-    - Открыть файл
-    """
     return InlineKeyboardMarkup(
         [
             [
@@ -599,7 +569,7 @@ def inspector_menu_inline() -> InlineKeyboardMarkup:
 
 
 # -------------------------------------------------
-# График: чтение листа «График»
+# График
 # -------------------------------------------------
 def get_schedule_df() -> Optional[pd.DataFrame]:
     SHEET = "График"
@@ -625,9 +595,6 @@ def get_schedule_df() -> Optional[pd.DataFrame]:
         return None
 
 
-# -------------------------------------------------
-# КРАСИВЫЙ EXCEL ДЛЯ ГРАФИКА
-# -------------------------------------------------
 HEADER_FILL = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
 BORDER = Border(
@@ -641,19 +608,9 @@ BORDER = Border(
 async def send_schedule_xlsx(
     chat_id: int, dataframe: pd.DataFrame, context: ContextTypes.DEFAULT_TYPE
 ):
-    """
-    Отправляет красиво отформатированный Excel-файл графика
-    с блоком согласования внизу листа.
-    Требования:
-    - убрать «№ п/п»;
-    - «Дата выезда» — короткий формат даты;
-    - «ОНзС» — центр;
-    - F/G — перенос текста.
-    """
     df = dataframe.copy().reset_index(drop=True)
     headers = list(df.columns)
 
-    # Попробуем привести «Дата выезда» к дате
     date_col_name: Optional[str] = None
     for h in headers:
         if "дата выезда" in str(h).lower():
@@ -673,26 +630,23 @@ async def send_schedule_xlsx(
 
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        # Пишем данные без индекса, шапку создаём вручную
         df.to_excel(
             writer,
             sheet_name="График выездов",
             index=False,
-            startrow=2,  # данные с 3-й строки (A3)
+            startrow=2,
             header=False,
         )
 
         wb = writer.book
         ws = writer.sheets["График выездов"]
 
-        # Заголовки (без «№ п/п»)
         for col_num, value in enumerate(headers, 1):
             cell = ws.cell(row=2, column=col_num, value=value)
             cell.fill = HEADER_FILL
             cell.font = HEADER_FONT
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        # автоширина
         for column in ws.columns:
             max_length = 0
             col_letter = column[0].column_letter
@@ -704,13 +658,11 @@ async def send_schedule_xlsx(
                     pass
             ws.column_dimensions[col_letter].width = min(max_length + 4, 50)
 
-        # заморозка верхней строки заголовков
         ws.freeze_panes = ws["A3"]
 
         last_col_letter = ws.cell(row=2, column=len(headers)).column_letter
         ws.auto_filter.ref = f"A2:{last_col_letter}{len(df) + 2}"
 
-        # рамки
         for row in ws[f"A3:{last_col_letter}{len(df) + 2}"]:
             for cell in row:
                 cell.border = BORDER
@@ -738,8 +690,6 @@ async def send_schedule_xlsx(
         )
         ws.add_table(tab)
 
-        # Дополнительное форматирование конкретных столбцов
-        # попытаемся найти нужные колонки по заголовкам
         date_idx = None
         onzs_idx = None
         dev_idx = None
@@ -756,7 +706,6 @@ async def send_schedule_xlsx(
             if obj_idx is None and "наименование объекта" in h_low:
                 obj_idx = i
 
-        # Применяем форматирование по строкам данных
         for row_idx in range(3, len(df) + 3):
             if date_idx:
                 cell = ws.cell(row=row_idx, column=date_idx)
@@ -777,15 +726,14 @@ async def send_schedule_xlsx(
                     horizontal="left", vertical="center", wrap_text=True
                 )
 
-        # красивый блок согласования
         if approvals:
             last_data_row = len(df) + 2
             summary_start = last_data_row + 2
 
-            header_text = build_schedule_header(version, approvals)
+            header = build_schedule_header(version, approvals)
             ws.merge_cells(f"A{summary_start}:{last_col_letter}{summary_start}")
             cell_header = ws[f"A{summary_start}"]
-            cell_header.value = header_text
+            cell_header.value = header
             cell_header.font = Font(bold=True, size=12, color="FFFFFF")
             cell_header.fill = PatternFill(
                 start_color="4F81BD", end_color="4F81BD", fill_type="solid"
@@ -894,8 +842,9 @@ def write_schedule_summary_to_sheet(version: int, approvals: List[sqlite3.Row]) 
             ["Согласовано всеми:"],
         ]
         for r in approvals:
-            line = f"{r['approver']} — {_format_dt(r['decided_at'])} ✅"
-            rows.append([line])
+            rows.append(
+                [f"{r['approver']} — {_format_dt(r['decided_at'])} ✅"]
+            )
 
         body = {"values": rows}
 
@@ -954,8 +903,9 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
     elif pending:
         lines.append("На согласовании у:")
         for a in pending:
-            req = _format_dt(by_approver[a]["requested_at"])
-            lines.append(f"• {a} — запрошено {req}")
+            lines.append(
+                f"• {a} — запрошено {_format_dt(by_approver[a]['requested_at'])}"
+            )
         if approved:
             lines.append("")
             lines.append("Уже согласовали:")
@@ -970,7 +920,7 @@ def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
 
 
 # -------------------------------------------------
-# Замечания: НЕ УСТРАНЕНЫ (общий список)
+# Замечания: НЕ УСТРАНЕНЫ
 # -------------------------------------------------
 def build_remarks_not_done_text(df: pd.DataFrame) -> str:
     COLS = {
@@ -1064,12 +1014,8 @@ def build_remarks_not_done_text(df: pd.DataFrame) -> str:
 
 
 def build_remarks_not_done_by_onzs(df: pd.DataFrame, onzs_value: str) -> str:
-    """
-    Строки со статусом «нет» только для выбранного ОНзС.
-    """
     sheet_name = get_current_remarks_sheet_name()
 
-    # Столбец ОНзС
     onzs_idx = get_col_index_by_header(df, "онзс", "D")
     if onzs_idx is None:
         return "Не удалось определить столбец ОНзС в файле замечаний."
@@ -1108,7 +1054,6 @@ def build_remarks_not_done_by_onzs(df: pd.DataFrame, onzs_value: str) -> str:
     num_str = normalize_onzs_value(onzs_value)
 
     for _, row in df.iterrows():
-        # фильтрация по ОНзС
         try:
             val_raw = row.iloc[onzs_idx]
         except Exception:
@@ -1185,9 +1130,6 @@ def build_remarks_not_done_by_onzs(df: pd.DataFrame, onzs_value: str) -> str:
 
 
 def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
-    """
-    Поиск по номеру дела в листе замечаний и красивый вывод карточек.
-    """
     sheet_name = get_current_remarks_sheet_name()
 
     case_no = case_no.strip()
@@ -1196,13 +1138,12 @@ def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
 
     target = normalize_case_number(case_no)
 
-    # Индексы основных столбцов
-    idx_case = get_col_index_by_header(df, "номер дела", "I")
+    idx_case = get_case_col_index(df)
     if idx_case is None:
-        idx_case = get_col_index_by_header(df, "номер дела", "H")
-
-    if idx_case is None:
-        return "Не удалось определить столбец «Номер дела» в файле замечаний."
+        return (
+            "Не удалось определить столбец «Номер дела (I)» в файле замечаний. "
+            "Проверьте структуру листа."
+        )
 
     idx_date = get_col_index_by_header(df, "дата выезда", "B")
     idx_onzs = get_col_index_by_header(df, "онзс", "D")
@@ -1215,7 +1156,6 @@ def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
     idx_ar = excel_col_to_index("X")
     idx_eom = excel_col_to_index("AD")
 
-    # фильтрация по номеру дела (маска по строкам)
     mask: List[bool] = []
     for _, row in df.iterrows():
         try:
@@ -1226,7 +1166,10 @@ def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
         mask.append(val_norm == target)
 
     if not any(mask):
-        return f"По номеру дела {case_no} ничего не найдено.\nЛист: {sheet_name}"
+        return (
+            f"По номеру дела {case_no} ничего не найдено.\n"
+            f"Лист: {sheet_name}"
+        )
 
     df_sel = df[mask]
 
@@ -1300,7 +1243,7 @@ def build_case_cards_text(df: pd.DataFrame, case_no: str) -> str:
 
 
 # -------------------------------------------------
-# Длинный текст по частям
+# Отправка длинного текста
 # -------------------------------------------------
 async def send_long_text(chat, text: str, chunk_size=3500):
     lines = text.split("\n")
@@ -1318,7 +1261,7 @@ async def send_long_text(chat, text: str, chunk_size=3500):
 
 
 # -------------------------------------------------
-# Считывание листа замечаний
+# Лист замечаний
 # -------------------------------------------------
 def get_remarks_df_current() -> Optional[pd.DataFrame]:
     sheet = get_current_remarks_sheet_name()
@@ -1338,13 +1281,9 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
 
 
 # -------------------------------------------------
-# Инспектор → Google Sheets (ячейка D с двумя строками)
+# Инспектор → Google Sheets
 # -------------------------------------------------
 def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
-    """
-    Пробуем записать выезд в общий файл Google Sheets.
-    Если не получится — возвращаем False, но локно всё равно сохраняем.
-    """
     service = get_sheets_service()
     if service is None:
         log.error("Google Sheets API недоступен.")
@@ -1396,7 +1335,7 @@ def append_inspector_row_to_excel(form: Dict[str, Any]) -> bool:
 
 
 # -------------------------------------------------
-# Инспектор — пошаговый мастер
+# Инспектор — мастер
 # -------------------------------------------------
 async def inspector_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -1523,18 +1462,11 @@ def onzs_menu_inline() -> InlineKeyboardMarkup:
 
 
 def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
-    """
-    Список дел по ОНзС с количеством.
-    Ищем столбцы по заголовкам, без жёсткой привязки к буквам.
-    """
-    # ОНзС обычно в столбце D, но ищем по заголовку
     onzs_idx = get_col_index_by_header(df, "онзс", "D")
     if onzs_idx is None:
         return "Не удалось определить столбец ОНзС в файле замечаний."
 
-    # Номер дела: заголовок содержит «номер дела», по умолчанию H
-    case_idx = get_col_index_by_header(df, "номер дела", "H")
-    # Адрес: «строительный адрес», по умолчанию H
+    case_idx = get_case_col_index(df)
     addr_idx = get_col_index_by_header(df, "строительный адрес", "H")
 
     num_str = normalize_onzs_value(number)
@@ -1554,7 +1486,6 @@ def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
 
     lines = [f"ОНзС = {number}", f"Найдено дел: {len(df_f)}", ""]
 
-    # аккуратно читаем значения, убирая NaN/пустые
     for _, row in df_f.iterrows():
 
         def safe(idx: Optional[int]) -> str:
@@ -1577,7 +1508,6 @@ def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
         case_no = safe(case_idx)
         addr = safe(addr_idx)
 
-        # если вообще ничего нет — не выводим строку
         if not case_no and not addr:
             continue
 
@@ -1592,7 +1522,7 @@ def build_onzs_list_by_number(df: pd.DataFrame, number: str) -> str:
 
 
 # -------------------------------------------------
-# Инспектор — просмотр и Excel
+# Инспектор — список/Excel
 # -------------------------------------------------
 def build_inspector_list_text(rows: List[sqlite3.Row]) -> str:
     if not rows:
@@ -1680,7 +1610,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = get_schedule_state()
     version = get_schedule_version(settings)
 
-    # ---------- ГРАФИК ----------
     if data == "schedule_refresh":
         df = get_schedule_df()
         if df is None:
@@ -1721,7 +1650,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---------- Согласование ----------
     if data.startswith("schedule_approve:") or data.startswith("schedule_rework:"):
         action, approver_tag = data.split(":", 1)
         user_username = user.username or ""
@@ -1775,7 +1703,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # ---------- ЗАМЕЧАНИЯ ----------
     if data == "remarks_search_case":
         context.user_data["awaiting_case_search"] = True
         await query.message.reply_text(
@@ -1787,7 +1714,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = onzs_menu_inline()
         msg = (
             "🏗 Раздел «ОНзС»\n\n"
-            "Выберите номер ОНзС, чтобы увидеть количество дел и список дел "
+            "Выберите номер ОНзС, чтобы увидеть список дел (Номер дела (I) + адрес) "
             "из текущего файла замечаний.\n"
             "Для выбранного ОНзС можно отдельно показать только неустранённые замечания."
         )
@@ -1813,7 +1740,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---------- ОНЗС ----------
     if data.startswith("onzs_filter_"):
         number = data.replace("onzs_filter_", "")
         df = get_remarks_df_current()
@@ -1851,7 +1777,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_text(query.message.chat, text)
         return
 
-    # ---------- ИНСПЕКТОР ----------
     if data == "inspector_add":
         context.user_data["inspector_form"] = {"step": "date"}
         await query.message.reply_text(
@@ -1890,12 +1815,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     chat = update.message.chat
 
-    # --- СНАЧАЛА мастер «Инспектор» ---
     if "inspector_form" in context.user_data:
         await inspector_process(update, context)
         return
 
-    # ввод комментария к "На доработку"
     if context.user_data.get("awaiting_rework_comment"):
         info = context.user_data.pop("awaiting_rework_comment")
         version = info["version"]
@@ -1907,7 +1830,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ввод списка согласующих
     if context.user_data.get("awaiting_approvers_input"):
         info = context.user_data.pop("awaiting_approvers_input")
         version = info["version"]
@@ -1955,10 +1877,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text_to_send = "\n".join(lines)
 
-        # 1) сообщение в чат, где админ вводил список
         await chat.send_message(text_to_send, reply_markup=kb)
 
-        # 2) дублирование в группу/канал, если задан SCHEDULE_NOTIFY_CHAT_ID
         if SCHEDULE_NOTIFY_CHAT_ID is not None:
             try:
                 await context.bot.send_message(
@@ -1976,7 +1896,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Согласующие сохранены и уведомлены.")
         return
 
-    # режим поиска по номеру дела
     if context.user_data.get("awaiting_case_search"):
         context.user_data.pop("awaiting_case_search", None)
         case_no = text.strip()
@@ -1992,7 +1911,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     low = text.lower()
 
-    # --------- Разделы главного меню ---------
     if low == "📅 график".lower():
         settings = get_schedule_state()
         is_adm = is_admin(update.effective_user.id)
@@ -2017,8 +1935,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = (
             "📝 Раздел «Замечания»\n\n"
             "Здесь доступны:\n"
-            "• 🔎 поиск по номеру дела (показывает полную строку);\n"
-            "• 🏗 ОНзС — выбор 1–12, список дел и отдельный просмотр неустранённых;\n"
+            "• 🔎 поиск по номеру дела (столбец I);\n"
+            "• 🏗 ОНзС — выбор 1–12, список дел (Номер дела (I) + адрес) и отдельный просмотр неустранённых;\n"
             "• 📥 открыть общий файл таблицы.\n\n"
             "Выберите нужное действие:"
         )
@@ -2087,7 +2005,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_text(chat, "\n".join(lines))
         return
 
-    # дефолт
     await update.message.reply_text(
         "Я вас не понял. Выберите пункт меню или нажмите /start.",
         reply_markup=main_menu(),
@@ -2123,7 +2040,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "Справка по боту СОТ:\n\n"
         "📅 График — показать статус согласования, обновить, скачать Excel.\n"
-        "📝 Замечания — поиск по номеру дела, работа с ОНзС и просмотр статусов «нет».\n"
+        "📝 Замечания — поиск по номеру дела (I), работа с ОНзС и просмотр статусов «нет».\n"
         "Инспектор — добавление и выгрузка выездов инспектора.\n"
         "📈 Аналитика — история согласований по версиям графика.\n"
     )
