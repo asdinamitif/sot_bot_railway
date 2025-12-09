@@ -1368,37 +1368,22 @@ def _parse_final_date(val) -> Optional[date]:
     Преобразует значение из столбцов O/P в дату.
     Поддерживает текстовые и «экселевские» даты.
     """
-    # Пустые и NaT сразу отбрасываем
     if val is None:
         return None
     try:
-        # Явный NaT от pandas
-        if isinstance(val, pd.Timestamp) and pd.isna(val):
-            return None
-
-        # Уже datetime / Timestamp
         if isinstance(val, (datetime, pd.Timestamp)):
-            if pd.isna(val):
-                return None
-            d = val.date()
-            # защита от NaT, который "просочился" через .date()
-            if isinstance(d, date):
-                return d
-            return None
-
-        # Чисто числовые "экселевские" даты
+            return val.date()
         if isinstance(val, (int, float)) and not pd.isna(val):
             dt = pd.to_datetime(val, errors="coerce")
-            if isinstance(dt, (datetime, pd.Timestamp)) and not pd.isna(dt):
+            if isinstance(dt, (datetime, pd.Timestamp)):
                 return dt.date()
-
-        # Текстовые даты
         dt = pd.to_datetime(str(val), dayfirst=True, errors="coerce")
-        if isinstance(dt, (datetime, pd.Timestamp)) and not pd.isna(dt):
+        if isinstance(dt, (datetime, pd.Timestamp)):
             return dt.date()
     except Exception:
         return None
     return None
+
 
 
 def filter_final_checks_df(
@@ -1409,10 +1394,12 @@ def filter_final_checks_df(
     basis: str = "any",  # "start" -> только O, "end" -> только P, "any" -> O или P
 ) -> pd.DataFrame:
     """
-    Универсальная фильтрация итоговых проверок:
+    Фильтрация итоговых проверок:
     - по номеру дела (столбец B),
-    - по периоду дат по выбранной базе: O (дата начала) или P (дата окончания).
+    - по периоду дат (столбцы O / P) с выбором базы.
+    Работает устойчиво при любых типах данных (datetime, числа Excel, строки).
     """
+    # Индексы столбцов
     idx_case = excel_col_to_index("B")
     idx_start = excel_col_to_index("O")
     idx_end = excel_col_to_index("P")
@@ -1422,52 +1409,59 @@ def filter_final_checks_df(
         basis = "any"
 
     df2 = df.copy()
-
-    # --- базовая маска: все строки включены ---
     mask = pd.Series(True, index=df2.index)
 
-    # --- фильтр по номеру дела ---
-    if case_no:
+    # --- Фильтр по номеру дела ---
+    if case_no and idx_case is not None and 0 <= idx_case < df2.shape[1]:
         case_filter_norm = normalize_case_number(case_no)
         if case_filter_norm:
-            case_vals = []
-            for _, row in df2.iterrows():
-                try:
-                    raw = row.iloc[idx_case]
-                except Exception:
-                    raw = None
-                val_norm = normalize_case_number(raw)
-                case_vals.append(val_norm == case_filter_norm)
-            mask &= pd.Series(case_vals, index=df2.index)
+            col_case = df2.iloc[:, idx_case]
+            case_mask = col_case.apply(
+                lambda v: normalize_case_number(v) == case_filter_norm
+            )
+            mask &= case_mask
 
-    # --- подготовка базовой даты по столбцам O/P ---
-    s_start_raw = df2.iloc[:, idx_start] if 0 <= idx_start < df2.shape[1] else pd.Series(index=df2.index, dtype="object")
-    s_end_raw = df2.iloc[:, idx_end] if 0 <= idx_end < df2.shape[1] else pd.Series(index=df2.index, dtype="object")
-
-    s_start = pd.to_datetime(s_start_raw, dayfirst=True, errors="coerce")
-    s_end = pd.to_datetime(s_end_raw, dayfirst=True, errors="coerce")
-
-    if basis == "start":
-        base = s_start
-    elif basis == "end":
-        base = s_end
-    else:  # "any"
-        base = s_start.combine_first(s_end)
-
-    # --- фильтр по периоду ---
+    # --- Фильтр по датам ---
     if start_date and end_date:
         start_ts = pd.Timestamp(start_date)
         end_ts = pd.Timestamp(end_date)
+
+        def _make_date_series(col_idx):
+            if col_idx is None or col_idx >= df2.shape[1] or col_idx < 0:
+                return pd.Series(pd.NaT, index=df2.index)
+
+            s = df2.iloc[:, col_idx]
+
+            # Уже datetime-тип
+            if pd.api.types.is_datetime64_any_dtype(s):
+                return s
+
+            # Чисто числовые значения (возможные "экселевские" даты)
+            if pd.api.types.is_numeric_dtype(s):
+                # пробуем как "excel serial" (дни с 1899-12-30)
+                dt = pd.to_datetime(s, origin="1899-12-30", unit="D", errors="coerce")
+                return dt
+
+            # Всё остальное — как строки
+            s_str = s.astype(str).str.strip()
+            dt = pd.to_datetime(s_str, dayfirst=True, errors="coerce")
+            return dt
+
+        s_start = _make_date_series(idx_start)
+        s_end = _make_date_series(idx_end)
+
+        if basis == "start":
+            base = s_start
+        elif basis == "end":
+            base = s_end
+        else:  # "any": сначала O, если пусто — P
+            base = s_start.where(s_start.notna(), s_end)
+
         between_mask = base.notna() & (base >= start_ts) & (base <= end_ts)
         mask &= between_mask
 
-    # --- итоговый датафрейм ---
-    if not len(df2.index):
-        return df2.iloc[0:0].copy()
-
     df_f = df2[mask].copy().reset_index(drop=True)
     return df_f
-
 
 
 def build_final_checks_text_filtered(
@@ -2144,7 +2138,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-
     # --- ИТОГОВЫЕ ПРОВЕРКИ ---
     if data == "final_week":
         # запоминаем режим и спрашиваем, по какой дате фильтровать
@@ -2224,20 +2217,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         mode = state.get("mode")
-
         # недельный и месячный режимы
         if mode in ("week", "month"):
-            # 1. читаем таблицу
-            try:
-                df = get_final_checks_df()
-            except Exception as e:
-                log.exception("Ошибка get_final_checks_df (итоговые проверки): %s", e)
-                await query.message.reply_text(
-                    f"Ошибка при чтении таблицы итоговых проверок: {type(e).__name__}: {e}"
-                )
-                context.user_data.pop("final_range_choice", None)
-                return
-
+            df = get_final_checks_df()
             if df is None:
                 await query.message.reply_text(
                     "Не удалось открыть таблицу итоговых проверок."
@@ -2245,7 +2227,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data.pop("final_range_choice", None)
                 return
 
-            # 2. считаем диапазон дат
             today = local_now().date()
             if mode == "week":
                 start = today - timedelta(days=7)
@@ -2259,53 +2240,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             basis_text = (
                 "по дате начала (O)" if basis == "start" else "по дате окончания (P)"
             )
+
             header = (
                 f"📋 Итоговые проверки {mode_text} {basis_text}\n"
                 f"{start:%d.%m.%Y} — {end:%d.%m.%Y}"
             )
-
-            # 3. собираем текст
-            try:
-                text_out = build_final_checks_text_filtered(
-                    df,
-                    start_date=start,
-                    end_date=end,
-                    header=header,
-                    basis=basis,
-                )
-            except Exception as e:
-                log.exception(
-                    "Ошибка build_final_checks_text_filtered (итоговые проверки): %s",
-                    e,
-                )
-                await query.message.reply_text(
-                    f"Ошибка при формировании текста итоговых проверок: {type(e).__name__}: {e}"
-                )
-                context.user_data.pop("final_range_choice", None)
-                return
-
-            # 4. отправляем текст
+            text_out = build_final_checks_text_filtered(
+                df,
+                start_date=start,
+                end_date=end,
+                header=header,
+                basis=basis,
+            )
             await send_long_text(query.message.chat, text_out)
-
-            # 5. пытаемся отправить Excel
-            try:
-                await send_final_checks_xlsx_filtered(
-                    chat_id=query.message.chat.id,
-                    df=df,
-                    context=context,
-                    start_date=start,
-                    end_date=end,
-                    basis=basis,
-                )
-            except Exception as e:
-                log.exception(
-                    "Ошибка send_final_checks_xlsx_filtered (итоговые проверки): %s",
-                    e,
-                )
-                await query.message.reply_text(
-                    f"Текст отправлен, но не удалось отправить Excel: {type(e).__name__}: {e}"
-                )
-
+            await send_final_checks_xlsx_filtered(
+                chat_id=query.message.chat.id,
+                df=df,
+                context=context,
+                start_date=start,
+                end_date=end,
+                basis=basis,
+            )
             context.user_data.pop("final_range_choice", None)
             return
 
@@ -2329,13 +2284,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "final_search_case":
-        context.user_data["awaiting_final_case_search"] = True
-        await query.message.reply_text(
-            "Введите номер дела (формат 00-00-000000), который нужно найти "
-            "в итоговых проверках:"
-        )
-        return
-
         context.user_data["awaiting_final_case_search"] = True
         await query.message.reply_text(
             "Введите номер дела (формат 00-00-000000), который нужно найти "
