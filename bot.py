@@ -107,9 +107,9 @@ FINAL_CHECKS_SPREADSHEET_ID = (
         "FINAL_CHECKS_SPREADSHEET_ID",
         "1dUO3neTKzKI3D8P6fs_LJLmWlL7jw-FhohtJkjz4KuE",
     ).strip()
-FINAL_CHECKS_LOCAL_PATH = os.getenv("FINAL_CHECKS_LOCAL_PATH", "final_checks.xlsx")
-
 )
+
+FINAL_CHECKS_LOCAL_PATH = os.getenv("FINAL_CHECKS_LOCAL_PATH", "final_checks.xlsx")
 
 
 def is_admin(uid: int) -> bool:
@@ -1332,6 +1332,7 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
 # -------------------------------------------------
 # Итоговые проверки: чтение, фильтр, текст, Excel
 # -------------------------------------------------
+
 def refresh_final_checks_local_file() -> bool:
     """
     Скачивает актуальную таблицу итоговых проверок в локальный файл FINAL_CHECKS_LOCAL_PATH.
@@ -1373,9 +1374,8 @@ def get_final_checks_df() -> Optional[pd.DataFrame]:
     """
     Читает локальный файл итоговых проверок FINAL_CHECKS_LOCAL_PATH,
     который обновляется при входе в раздел «Итоговые проверки».
-    Собирает данные со ВСЕХ листов книги и склеивает их в один DataFrame.
+    Собирает данные со всех листов книги и склеивает их в один DataFrame.
     """
-    # если локального файла нет — пытаемся скачать
     if not os.path.exists(FINAL_CHECKS_LOCAL_PATH):
         log.warning(
             "Локальный файл итоговых проверок не найден, пробуем скачать заново."
@@ -1393,7 +1393,7 @@ def get_final_checks_df() -> Optional[pd.DataFrame]:
         for sheet_name in xls.sheet_names:
             try:
                 df_sheet = pd.read_excel(xls, sheet_name=sheet_name)
-                df_sheet = df_sheet.dropna(how="all").reset_index(drop=True)
+                df_sheet = df_sheet.dropna(how="all")
                 if df_sheet.empty:
                     continue
                 dfs.append(df_sheet)
@@ -1409,11 +1409,11 @@ def get_final_checks_df() -> Optional[pd.DataFrame]:
             return None
 
         df_all = pd.concat(dfs, ignore_index=True)
+        df_all = df_all.reset_index(drop=True)
         return df_all
     except Exception as e:
         log.error("Ошибка чтения локального файла итоговых проверок: %s", e)
         return None
-
 
 
 def _parse_final_date(val) -> Optional[date]:
@@ -2632,7 +2632,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if low == "итоговые проверки":
-        # каждый вход в раздел — обновляем локальный файл итоговых проверок
+        # каждый заход в раздел «Итоговые проверки» обновляем локальный файл
         ok = refresh_final_checks_local_file()
         if not ok:
             await update.message.reply_text(
@@ -2644,7 +2644,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = final_checks_menu_inline()
         msg = (
             "📋 Раздел «Итоговые проверки»\n\n"
-            "Файл итоговых проверок обновлён.\n\n"
             "Вы можете:\n"
             "• посмотреть проверки за последнюю неделю;\n"
             "• за последний месяц;\n"
