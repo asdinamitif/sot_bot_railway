@@ -109,7 +109,12 @@ FINAL_CHECKS_SPREADSHEET_ID = (
     ).strip()
 )
 
-FINAL_CHECKS_LOCAL_PATH = os.getenv("FINAL_CHECKS_LOCAL_PATH", "final_checks.xlsx")
+
+FINAL_CHECKS_LOCAL_PATH = os.getenv(
+    "FINAL_CHECKS_LOCAL_PATH",
+    "final_checks.xlsx",
+).strip()
+
 
 
 def is_admin(uid: int) -> bool:
@@ -1332,11 +1337,11 @@ def get_remarks_df_current() -> Optional[pd.DataFrame]:
 # -------------------------------------------------
 # Итоговые проверки: чтение, фильтр, текст, Excel
 # -------------------------------------------------
-
 def refresh_final_checks_local_file() -> bool:
     """
-    Скачивает актуальную таблицу итоговых проверок в локальный файл FINAL_CHECKS_LOCAL_PATH.
-    Старую версию файла при наличии удаляет.
+    Обновляет локальный файл итоговых проверок:
+    - удаляет старый файл (если есть);
+    - скачивает актуальную версию из Google Sheets по FINAL_CHECKS_SPREADSHEET_ID.
     """
     sheet_id = FINAL_CHECKS_SPREADSHEET_ID
     if not sheet_id:
@@ -1344,6 +1349,18 @@ def refresh_final_checks_local_file() -> bool:
         return False
 
     url = build_export_url(sheet_id)
+    path = FINAL_CHECKS_LOCAL_PATH
+
+    # удаляем старый файл, если есть
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        log.warning(
+            "Не удалось удалить старый файл итоговых проверок %s: %s",
+            path,
+            e,
+        )
 
     try:
         resp = requests.get(url, timeout=30)
@@ -1353,20 +1370,16 @@ def refresh_final_checks_local_file() -> bool:
         return False
 
     try:
-        # удаляем старый файл, если есть
-        try:
-            os.remove(FINAL_CHECKS_LOCAL_PATH)
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            log.warning("Не удалось удалить старый файл итоговых проверок: %s", e)
-
-        with open(FINAL_CHECKS_LOCAL_PATH, "wb") as f:
+        with open(path, "wb") as f:
             f.write(resp.content)
-        log.info("Файл итоговых проверок обновлён: %s", FINAL_CHECKS_LOCAL_PATH)
+        log.info("Файл итоговых проверок сохранён локально: %s", path)
         return True
     except Exception as e:
-        log.error("Ошибка сохранения файла итоговых проверок: %s", e)
+        log.error(
+            "Ошибка записи локального файла итоговых проверок %s: %s",
+            path,
+            e,
+        )
         return False
 
 
@@ -1376,41 +1389,42 @@ def get_final_checks_df() -> Optional[pd.DataFrame]:
     который обновляется при входе в раздел «Итоговые проверки».
     Собирает данные со всех листов книги и склеивает их в один DataFrame.
     """
-    if not os.path.exists(FINAL_CHECKS_LOCAL_PATH):
-        log.warning(
-            "Локальный файл итоговых проверок не найден, пробуем скачать заново."
-        )
-        if not refresh_final_checks_local_file():
-            return None
+    path = FINAL_CHECKS_LOCAL_PATH
+    if not path:
+        log.error("FINAL_CHECKS_LOCAL_PATH не задан.")
+        return None
+
+    if not os.path.exists(path):
+        log.error("Локальный файл итоговых проверок не найден: %s", path)
+        return None
 
     try:
-        xls = pd.ExcelFile(FINAL_CHECKS_LOCAL_PATH)
+        xls = pd.ExcelFile(path)
         if not xls.sheet_names:
             log.error("Файл итоговых проверок пуст (нет листов).")
             return None
 
-        dfs: List[pd.DataFrame] = []
+        frames: List[pd.DataFrame] = []
         for sheet_name in xls.sheet_names:
             try:
                 df_sheet = pd.read_excel(xls, sheet_name=sheet_name)
                 df_sheet = df_sheet.dropna(how="all")
-                if df_sheet.empty:
-                    continue
-                dfs.append(df_sheet)
+                if not df_sheet.empty:
+                    frames.append(df_sheet)
             except Exception as e:
-                log.error(
-                    "Ошибка чтения листа итоговых проверок '%s': %s",
+                log.warning(
+                    "Ошибка чтения листа '%s' итоговых проверок: %s",
                     sheet_name,
                     e,
                 )
 
-        if not dfs:
-            log.error("Не удалось прочитать ни один лист итоговых проверок.")
+        if not frames:
+            log.error("Во всех листах итоговых проверок нет данных.")
             return None
 
-        df_all = pd.concat(dfs, ignore_index=True)
-        df_all = df_all.reset_index(drop=True)
-        return df_all
+        df = pd.concat(frames, ignore_index=True)
+        df = df.reset_index(drop=True)
+        return df
     except Exception as e:
         log.error("Ошибка чтения локального файла итоговых проверок: %s", e)
         return None
@@ -2632,18 +2646,19 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if low == "итоговые проверки":
-        # каждый заход в раздел «Итоговые проверки» обновляем локальный файл
+        # каждый раз при входе в раздел обновляем локальный файл итоговых проверок
         ok = refresh_final_checks_local_file()
         if not ok:
             await update.message.reply_text(
-                "Не удалось обновить файл итоговых проверок. "
-                "Проверьте доступ к таблице или попробуйте позже."
+                "Не удалось обновить файл итоговых проверок.\n"
+                "Проверьте доступ к Google Sheets и переменную FINAL_CHECKS_SPREADSHEET_ID."
             )
             return
 
         kb = final_checks_menu_inline()
         msg = (
             "📋 Раздел «Итоговые проверки»\n\n"
+            "Файл итоговых проверок обновлён.\n\n"
             "Вы можете:\n"
             "• посмотреть проверки за последнюю неделю;\n"
             "• за последний месяц;\n"
