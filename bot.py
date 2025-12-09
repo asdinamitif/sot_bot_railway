@@ -246,16 +246,38 @@ def normalize_onzs_value(val) -> Optional[str]:
 
 
 def normalize_case_number(val) -> str:
+    """
+    Нормализация номера дела:
+
+    - приводим все нестандартные тире к обычному '-';
+    - убираем пробелы;
+    - выбрасываем любые символы, кроме цифр и '-'.
+
+    Примеры:
+    'Дело № 03–46–108600 (ПП)' -> '03-46-108600'
+    ' 01-29-099900 ' -> '01-29-099900'
+    """
     if val is None:
         return ""
     s = str(val).strip()
     if not s:
         return ""
+
+    # все «косые» тире в нормальное
     hyphens = ["\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212"]
     for h in hyphens:
         s = s.replace(h, "-")
+
+    # убираем пробелы
     s = s.replace(" ", "")
-    return s
+
+    # оставляем только цифры и '-'
+    cleaned_chars = []
+    for ch in s:
+        if ch.isdigit() or ch == "-":
+            cleaned_chars.append(ch)
+
+    return "".join(cleaned_chars)
 
 
 def get_case_col_index(df: pd.DataFrame) -> Optional[int]:
@@ -849,7 +871,7 @@ def build_schedule_header(version: int, approvals: List[sqlite3.Row]) -> str:
     d_from, d_to = _compute_schedule_dates(approvals)
     if not d_from or not d_to:
         return f"📅 График выездов (версия {version})"
-    return f"📅 График выездов с {d_from:%d.%m.%Y} по {d_to:%d.%м.%Y} г"
+    return f"📅 График выездов с {d_from:%d.%m.%Y} по {d_to:%d.%m.%Y} г"
 
 
 def write_schedule_summary_to_sheet(version: int, approvals: List[sqlite3.Row]) -> None:
@@ -1379,14 +1401,17 @@ def filter_final_checks_df(
     for _, row in df.iterrows():
         include = True
 
+        # --- фильтр по номеру дела ---
         if case_filter_norm:
             try:
                 case_val = row.iloc[idx_case]
             except Exception:
                 case_val = None
-            if normalize_case_number(case_val) != case_filter_norm:
+            val_norm = normalize_case_number(case_val)
+            if not val_norm or val_norm != case_filter_norm:
                 include = False
 
+        # --- фильтр по периоду ---
         if include and start_date and end_date:
             try:
                 s_raw = row.iloc[idx_start]
@@ -1795,7 +1820,7 @@ def build_inspector_list_text(rows: List[sqlite3.Row]) -> str:
     for r in rows:
         d = r["date"] or ""
         try:
-            d_fmt = datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y")
+            d_fmt = datetime.strptime(d, "%Y-%m-%d").strftime("%d.%м.%Y")
         except Exception:
             d_fmt = d
         lines.append(
@@ -2125,7 +2150,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "final_period":
         context.user_data["final_period"] = {"step": "start"}
         await query.message.reply_text(
-            "Введите дату начала периода (ДД.ММ.ГГГГ):"
+            "Введите дату начала периода (ДД.ММ.ГГГГ) или диапазон "
+            "ДД.ММ.ГГГГ-ДД.ММ.ГГГГ (например, 05.01.2025-12.12.2025):"
         )
         return
 
@@ -2150,14 +2176,76 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await inspector_process(update, context)
         return
 
-    # Итоговые проверки — произвольный период
+    # Итоговые проверки — пользовательский период
     if context.user_data.get("final_period"):
         period = context.user_data["final_period"]
         step = period.get("step")
 
+        # ШАГ 1: пользователь вводит либо одну дату, либо диапазон "дд.мм.гггг-дд.мм.гггг"
         if step == "start":
             try:
-                start_date = datetime.strptime(text, "%d.%m.%Y").date()
+                raw = text.strip()
+                # поддерживаем разные тире
+                raw_norm = (
+                    raw.replace("—", "-")
+                    .replace("–", "-")
+                    .replace("−", "-")
+                )
+
+                # ВВЕДЁН СРАЗУ ДИАПАЗОН "05.01.2025-12.12.2025"
+                if "-" in raw_norm:
+                    part1, part2 = [p.strip() for p in raw_norm.split("-", 1)]
+                    start_date = datetime.strptime(part1, "%d.%m.%Y").date()
+                    end_date = datetime.strptime(part2, "%d.%м.%Y").date()
+
+                    # грубая проверка года
+                    for d in (start_date, end_date):
+                        if d.year < 2000 or d.year > 2100:
+                            raise ValueError("year out of range")
+
+                    if end_date < start_date:
+                        await update.message.reply_text(
+                            "Дата окончания раньше даты начала.\n"
+                            "Введите даты в порядке: начало-конец "
+                            "в формате ДД.ММ.ГГГГ-ДД.ММ.ГГГГ "
+                            "(например, 05.01.2025-12.12.2025)."
+                        )
+                        return
+
+                    df = get_final_checks_df()
+                    if df is None:
+                        await update.message.reply_text(
+                            "Не удалось открыть таблицу итоговых проверок."
+                        )
+                        context.user_data.pop("final_period", None)
+                        return
+
+                    header = (
+                        f"📋 Итоговые проверки за период "
+                        f"{start_date:%d.%m.%Y} — {end_date:%d.%m.%Y}"
+                    )
+                    text_out = build_final_checks_text_filtered(
+                        df,
+                        start_date=start_date,
+                        end_date=end_date,
+                        header=header,
+                    )
+                    await send_long_text(chat, text_out)
+                    await send_final_checks_xlsx_filtered(
+                        chat_id=chat.id,
+                        df=df,
+                        context=context,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                    context.user_data.pop("final_period", None)
+                    return
+
+                # ВВЕДЕНА ОДНА ДАТА НАЧАЛА
+                start_date = datetime.strptime(raw_norm, "%d.%m.%Y").date()
+                if start_date.year < 2000 or start_date.year > 2100:
+                    raise ValueError("year out of range")
+
                 period["start_date"] = start_date
                 period["step"] = "end"
                 context.user_data["final_period"] = period
@@ -2166,19 +2254,25 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 await update.message.reply_text(
-                    "Дата начала в неверном формате. "
-                    "Введите в виде ДД.ММ.ГГГГ (например, 01.12.2025)."
+                    "Дата начала в неверном формате.\n"
+                    "Введите в виде ДД.ММ.ГГГГ (например, 05.01.2025)\n"
+                    "или диапазон ДД.ММ.ГГГГ-ДД.ММ.ГГГГ (например, 05.01.2025-12.12.2025)."
                 )
             return
 
+        # ШАГ 2: пользователь вводит дату окончания
         if step == "end":
             try:
-                end_date = datetime.strptime(text, "%d.%м.%Y").date()
+                raw = text.strip()
+                end_date = datetime.strptime(raw, "%d.%m.%Y").date()
+                if end_date.year < 2000 or end_date.year > 2100:
+                    raise ValueError("year out of range")
+
                 start_date = period.get("start_date")
                 if start_date and end_date < start_date:
                     await update.message.reply_text(
-                        "Дата окончания раньше даты начала. "
-                        "Введите корректную дату окончания (ДД.ММ.ГГГГ):"
+                        "Дата окончания раньше даты начала.\n"
+                        "Введите корректную дату окончания (ДД.ММ.ГГГГ)."
                     )
                     return
 
@@ -2208,8 +2302,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data.pop("final_period", None)
             except Exception:
                 await update.message.reply_text(
-                    "Дата окончания в неверном формате. "
-                    "Введите в виде ДД.ММ.ГГГГ (например, 31.12.2025)."
+                    "Дата окончания в неверном формате.\n"
+                    "Введите в виде ДД.ММ.ГГГГ (например, 12.12.2025)."
                 )
             return
 
